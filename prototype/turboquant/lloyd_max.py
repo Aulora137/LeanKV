@@ -23,7 +23,16 @@ Reference: Lloyd (1982), Max (1960), TurboQuant Section 3.1
 import torch
 import numpy as np
 from scipy import integrate, optimize, stats
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
+
+# Mapping from fractional bits to number of quantization levels
+BITS_TO_LEVELS = {
+    2: 4, 2.5: 6, 3: 8, 3.125: 9, 3.5: 12, 4: 16,
+}
+SUPPORTED_BITS = sorted(BITS_TO_LEVELS.keys())
+
+# Module-level codebook cache: (n_levels, dim) -> (levels, boundaries)
+_codebook_cache: dict = {}
 
 
 def beta_pdf(x: float, d: int) -> float:
@@ -126,23 +135,26 @@ def lloyd_max_1d(
 
 
 def compute_codebook(
-    bits: int,
+    bits: Union[int, float],
     dim: int = 128,
     use_gaussian_approx: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """Compute optimal Lloyd-Max codebook for post-rotation distribution.
 
     Args:
-        bits: Number of quantization bits (2, 3, or 4)
+        bits: Quantization bits (supports fractional: 2, 2.5, 3, 3.125, 3.5, 4)
         dim: Head dimension d (affects Beta distribution shape)
         use_gaussian_approx: If True, use N(0, 1/d) approximation (faster, accurate for d≥64)
 
     Returns:
-        levels: Optimal reconstruction levels (2^bits values)
-        boundaries: Decision boundaries (2^bits - 1 values)
+        levels: Optimal reconstruction levels
+        boundaries: Decision boundaries
         mse: Mean squared error per coordinate
     """
-    n_levels = 2 ** bits
+    if bits in BITS_TO_LEVELS:
+        n_levels = BITS_TO_LEVELS[bits]
+    else:
+        n_levels = round(2 ** bits)
 
     if use_gaussian_approx and dim >= 32:
         # N(0, 1/d) approximation — accurate for d ≥ 32
@@ -162,22 +174,33 @@ def compute_codebook(
 
 # Pre-computed codebooks for common configurations
 # These are computed once and hardcoded for efficiency (matching TurboQuant paper)
-def get_precomputed_codebook(bits: int, dim: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Get pre-computed Lloyd-Max codebook.
+def get_precomputed_codebook(bits: Union[int, float], dim: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Get Lloyd-Max codebook with caching.
 
-    For the C++ implementation, these values are stored as constexpr tables.
+    Supports fractional bits (2, 2.5, 3, 3.125, 3.5, 4).
+    Codebooks are cached so Lloyd-Max only runs once per (bits, dim) pair.
 
     Args:
-        bits: 2, 3, or 4
+        bits: Quantization bits (integer or fractional)
         dim: Head dimension
 
     Returns:
         levels: Tensor of reconstruction values
         boundaries: Tensor of decision boundaries
     """
-    # Compute (could cache these to disk for faster startup)
-    levels, boundaries, mse = compute_codebook(bits, dim)
-    return torch.tensor(levels, dtype=torch.float32), torch.tensor(boundaries, dtype=torch.float32)
+    if bits in BITS_TO_LEVELS:
+        n_levels = BITS_TO_LEVELS[bits]
+    else:
+        n_levels = round(2 ** bits)
+
+    cache_key = (n_levels, dim)
+    if cache_key not in _codebook_cache:
+        levels, boundaries, mse = compute_codebook(bits, dim)
+        _codebook_cache[cache_key] = (
+            torch.tensor(levels, dtype=torch.float32),
+            torch.tensor(boundaries, dtype=torch.float32),
+        )
+    return _codebook_cache[cache_key]
 
 
 def quantize_scalar(

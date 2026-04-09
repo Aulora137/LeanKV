@@ -31,10 +31,11 @@ Memory per KV element:
   Compression: ~4.6x
 """
 
+import math
 import torch
-from typing import Tuple, Optional, NamedTuple
+from typing import Tuple, Optional, Union, NamedTuple
 from .rotation import generate_per_layer_rotations, apply_rotation
-from .lloyd_max import get_precomputed_codebook, quantize_scalar, dequantize_scalar
+from .lloyd_max import get_precomputed_codebook, quantize_scalar, dequantize_scalar, BITS_TO_LEVELS
 from .qjl_residual import QJLResidual
 
 
@@ -43,7 +44,7 @@ class QuantizedKV(NamedTuple):
     indices: torch.Tensor      # uint8: Lloyd-Max indices, shape (..., d)
     qjl_signs: Optional[torch.Tensor]  # uint8 packed: QJL signs, shape (..., d//8)
     qjl_mean_abs: Optional[torch.Tensor]  # float32: mean |residual|, shape (...)
-    norms: torch.Tensor        # float32: original vector norms, shape (...)
+    norms: torch.Tensor        # float32: per-vector or per-group norms
 
 
 class TurboQuantizer:
@@ -54,7 +55,9 @@ class TurboQuantizer:
     Args:
         n_layers: Number of transformer layers
         head_dim: Attention head dimension (must be power of 2)
-        bits: Quantization bit-width (2, 3, or 4)
+        bits: Quantization bit-width (2, 2.5, 3, 3.125, 3.5, or 4)
+        group_size: Quantization group size (default=None → head_dim).
+                    Smaller groups = finer per-group scale = better quality but more overhead.
         rotation_strategy: "random_orthogonal", "hadamard", or "randomized_hadamard"
         use_qjl: Whether to apply QJL residual correction
         seed: Random seed for reproducibility
@@ -65,7 +68,8 @@ class TurboQuantizer:
         self,
         n_layers: int,
         head_dim: int,
-        bits: int = 3,
+        bits: Union[int, float] = 3,
+        group_size: Optional[int] = None,
         rotation_strategy: str = "randomized_hadamard",
         use_qjl: bool = True,
         seed: int = 42,
@@ -74,10 +78,15 @@ class TurboQuantizer:
         self.n_layers = n_layers
         self.head_dim = head_dim
         self.bits = bits
+        self.group_size = min(group_size, head_dim) if group_size is not None else head_dim
         self.use_qjl = use_qjl
         self.device = device
 
-        # Generate per-layer rotation matrices
+        assert head_dim % self.group_size == 0, \
+            f"head_dim ({head_dim}) must be divisible by group_size ({self.group_size})"
+        self.n_groups = head_dim // self.group_size
+
+        # Generate per-layer rotation matrices (always full head_dim)
         self.rotations = generate_per_layer_rotations(
             n_layers, head_dim, rotation_strategy, seed
         )
@@ -106,29 +115,41 @@ class TurboQuantizer:
         Returns:
             QuantizedKV with packed indices, optional QJL data, and norms
         """
-        # Save norms for rescaling at dequantization
-        norms = x.norm(dim=-1)  # (batch, n_heads, seq_len)
-
-        # Normalize to unit sphere (TurboQuant assumes ‖x‖=1)
-        x_normalized = x / (norms.unsqueeze(-1) + 1e-10)
-
-        # Apply rotation: x_rot = x_norm @ Π^T
+        # Apply rotation first (full head_dim)
         rotation = self.rotations[layer_idx]
-        x_rotated = apply_rotation(x_normalized, rotation)
+        x_rotated = apply_rotation(x, rotation)
 
-        # Lloyd-Max quantize
-        indices = quantize_scalar(x_rotated, self.boundaries)
-        reconstructed = dequantize_scalar(indices, self.levels)
+        if self.group_size < self.head_dim:
+            # Per-group quantization: reshape, compute per-group scale
+            orig_shape = x_rotated.shape  # (batch, n_heads, seq, head_dim)
+            x_grouped = x_rotated.reshape(*orig_shape[:-1], self.n_groups, self.group_size)
+            # Per-group amax scale
+            norms = x_grouped.abs().amax(dim=-1)  # (batch, n_heads, seq, n_groups)
+            x_normalized = x_grouped / (norms.unsqueeze(-1) + 1e-10)
+            # Quantize in [-1, 1] range
+            indices = quantize_scalar(x_normalized, self.boundaries)
+            reconstructed = dequantize_scalar(indices, self.levels)
+            # Flatten back for QJL
+            x_normalized_flat = x_normalized.reshape(orig_shape)
+            reconstructed_flat = reconstructed.reshape(orig_shape)
+        else:
+            # Original per-vector quantization
+            norms = x.norm(dim=-1)  # (batch, n_heads, seq_len)
+            x_normalized = x_rotated / (norms.unsqueeze(-1) + 1e-10)
+            indices = quantize_scalar(x_normalized, self.boundaries)
+            reconstructed = dequantize_scalar(indices, self.levels)
+            x_normalized_flat = x_normalized
+            reconstructed_flat = reconstructed
 
         # QJL residual correction
         qjl_signs = None
         qjl_mean_abs = None
         if self.qjl is not None:
-            residual = x_rotated - reconstructed
+            residual = x_normalized_flat - reconstructed_flat
             qjl_signs, qjl_mean_abs = self.qjl.encode(residual, pack=True)
 
         return QuantizedKV(
-            indices=indices.to(torch.uint8),
+            indices=indices.to(torch.uint8).reshape(*x.shape[:-1], self.head_dim),
             qjl_signs=qjl_signs,
             qjl_mean_abs=qjl_mean_abs,
             norms=norms,
@@ -141,10 +162,6 @@ class TurboQuantizer:
         apply_inverse_rot: bool = False,
     ) -> torch.Tensor:
         """Dequantize a cached KV embedding.
-
-        For attention computation, inverse rotation is NOT needed if Q is
-        also rotated (which it is). Set apply_inverse_rot=True only for
-        debugging or when computing values (V cache doesn't use rotation).
 
         Args:
             qkv: QuantizedKV struct
@@ -165,8 +182,15 @@ class TurboQuantizer:
             )
             reconstructed = reconstructed + correction
 
-        # Rescale by original norms
-        reconstructed = reconstructed * qkv.norms.unsqueeze(-1)
+        if self.group_size < self.head_dim:
+            # Rescale by per-group norms
+            orig_shape = reconstructed.shape
+            reconstructed = reconstructed.reshape(*orig_shape[:-1], self.n_groups, self.group_size)
+            reconstructed = reconstructed * qkv.norms.unsqueeze(-1)
+            reconstructed = reconstructed.reshape(orig_shape)
+        else:
+            # Rescale by per-vector norms
+            reconstructed = reconstructed * qkv.norms.unsqueeze(-1)
 
         # Optionally apply inverse rotation
         if apply_inverse_rot:
@@ -200,16 +224,16 @@ class TurboQuantizer:
         """Compute total memory cost in bits per KV element.
 
         Components:
-        - Lloyd-Max indices: self.bits per element
+        - Lloyd-Max indices: log2(n_levels) per element
         - QJL signs: 1 bit per element (if enabled)
         - QJL mean_abs: 32 bits / head_dim per element (if enabled)
-        - Norms: 32 bits / head_dim per element
+        - Group scale: 32 bits / group_size per element
         """
-        total = float(self.bits)
+        total = math.log2(BITS_TO_LEVELS.get(self.bits, round(2 ** self.bits)))
         if self.use_qjl:
             total += 1.0  # sign bits
             total += 32.0 / self.head_dim  # mean_abs overhead
-        total += 32.0 / self.head_dim  # norm overhead
+        total += 32.0 / self.group_size  # per-group scale overhead
         return total
 
     def compression_ratio(self, baseline_bits: int = 16) -> float:
@@ -218,6 +242,6 @@ class TurboQuantizer:
 
     def __repr__(self) -> str:
         return (f"TurboQuantizer(layers={self.n_layers}, head_dim={self.head_dim}, "
-                f"bits={self.bits}, qjl={self.use_qjl}, "
+                f"bits={self.bits}, group_size={self.group_size}, qjl={self.use_qjl}, "
                 f"effective_bits={self.memory_bits_per_element():.2f}, "
                 f"compression={self.compression_ratio():.1f}x)")

@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .DS_Store
+*.log
+prototype/eval/wikitext-2-raw/
+prototype/eval/wikitext-2-raw-v1.zip
+src/test-tq
