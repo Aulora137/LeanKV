@@ -821,6 +821,174 @@ are unchanged.
 
 ---
 
+## 12. AVX2 TQ3_0 Validation (Phase 3b)
+
+**Date:** 2026-04-10
+**Hardware:** AMD Ryzen, AVX2 (no AVX512), 8 threads
+**Software:** Lean_llama.cpp (commit `5d2fcb76` + K-side fix), CPU-only (ngl=0)
+**Model:** Qwen 3.5-9B Q4_K_M (head_dim=256, 4 KV heads, 32 layers)
+**Dataset:** WikiText-2 raw test split, 2048-token context
+
+### 12.1 Bug Found: IQK FA K-side Crash
+
+The TQ3_0 IQK FA kernel (`HelperTQ30`) was added for V-side dequantization
+(float-space lookup via `_mm_shuffle_epi8` + codebook), and `GGML_TYPE_TQ3_0`
+was added to `supported_kv_types()`. However, the K-side K×Q computation
+path was never wired up:
+
+1. `HelperTQ30` was **missing** from the `FlashAttn::compute` `if constexpr`
+   list (line 1656 of `iqk_fa_templates.h`), which routes quantized K types
+   to the `compute_helper_q` path.
+
+2. No `TQ3_0_UnpackerS` kernel existed in `iqk_gemm_legacy_quants.cpp` for
+   the K×Q dot product computation.
+
+**Result:** TQ3_0 K-side fell through to `compute_helper` (float matmul path)
+which called `iqk_gemm_default_floats`, interpreting packed 3-bit data as raw
+floats → NaN attention scores → `GGML_ASSERT(S > 0)` crash on all threads.
+
+**Fix:** Removed `GGML_TYPE_TQ3_0` from `supported_kv_types()` so it falls
+back to generic FA (scalar `vec_dot` path), matching the ARM/M2 behavior.
+
+### 12.2 TQ3_0 Results (Generic FA, AVX2)
+
+**Sanity test:**
+```
+llama-cli -m Qwen3.5-9B-Q4_K_M.gguf -ngl 0 -ctk tq3_0 -ctv tq3_0 -c 2048 \
+  -p "The capital of France is" -n 16 --no-display-prompt
+```
+Output: "Paris. The capital of France is Paris." — coherent, correct.
+
+**Perplexity (3 chunks):**
+
+| Config | Chunk 1 | Chunk 2 | Chunk 3 | PPL (3-chunk) | Delta from F16 |
+|--------|---------|---------|---------|---------------|----------------|
+| F16/F16 | 6.60 | 7.85 | 7.91 | 7.91 | -- |
+| TQ3/TQ3 | 6.76 | 8.00 | 8.04 | 8.04 | **+0.13** |
+
+**Speed:** 5.96 tok/s decode (generic FA path, no IQK acceleration).
+
+### 12.3 Cross-Platform Comparison (M2 vs AVX2)
+
+| Metric | M2 (generic) | AVX2 (generic) |
+|--------|-------------|----------------|
+| TQ3/TQ3 PPL (3 chunks) | 8.10 | 8.04 |
+| Delta from F16 | +0.05 | +0.13 |
+| Decode speed | 1.8 tok/s | 5.96 tok/s |
+
+PPL quality is consistent across platforms. The AVX2 delta (+0.13) is slightly
+larger than M2 (+0.05) — both are well within the +0.3 target from TQ3PLAN.md.
+AVX2 is 3.3x faster than M2 on the generic path as expected (more cores,
+higher clock).
+
+**Optimal rounding confirmed active:** The `quantize_row_tq3_0_ref` function
+includes coordinate descent optimization (2 passes, adjacent-level search with
+least-squares optimal scale recomputation). This is the same improved quantizer
+that produced the M2 results.
+
+### 12.4 IQK FA Kernel Implementation
+
+Implemented the K-side IQK mul_mat kernel for TQ3_0:
+
+1. `TQ3_0_DequantizerS` — scalar 3-bit unpack (4 groups × `unpack8()`) +
+   PSHUFB codebook lookup via `_mm256_shuffle_epi8`. Returns 32 signed int8
+   codebook values per block. No saturation risk (max pair sum 32258 < 32767).
+
+2. `TQ3_0_UnpackerS` — `Q_Unpacker<block_tq3_0, ScaleHelperTQ4_0_S,
+   TQ3_0_DequantizerS>`. Reuses TQ4_0's scale helper (both use d/127).
+
+3. Dispatch: added to `mul_mat_kernel`, `set_functions`,
+   `iqk_set_kernels_legacy_quants`, and `MulMat::prepare`.
+
+4. Added `HelperTQ30` to `FlashAttn::compute` `if constexpr` list.
+
+5. Re-added `GGML_TYPE_TQ3_0` to `supported_kv_types()`.
+
+**Files modified:**
+- `ggml/src/iqk/iqk_gemm_legacy_quants.cpp` — kernel structs + dispatch
+- `ggml/src/iqk/iqk_mul_mat.cpp` — MulMat::prepare entry
+- `ggml/src/iqk/fa/iqk_fa_templates.h` — K-side if-constexpr routing
+- `ggml/src/iqk/iqk_flash_attn.cpp` — supported_kv_types re-add
+
+### 12.5 TQ3_0 IQK FA Results
+
+**Perplexity (3 chunks, IQK FA ON):**
+
+| Config | Chunk 1 | Chunk 2 | Chunk 3 | PPL (3-chunk) | Delta from F16 |
+|--------|---------|---------|---------|---------------|----------------|
+| F16/F16 | 6.60 | 7.85 | 7.91 | 7.91 | -- |
+| TQ3/TQ3 (generic) | 6.76 | 8.00 | 8.04 | 8.04 | +0.13 |
+| TQ3/TQ3 (IQK FA) | 6.75 | 7.99 | 8.04 | **8.04** | **+0.13** |
+
+**No quality regression** — IQK FA produces identical PPL to generic FA.
+
+**Speed comparison (prefill, tok/s):**
+
+| Config | Prefill tok/s | vs F16 | 3-chunk time |
+|--------|--------------|--------|-------------|
+| F16/F16 | 58.8 | 100% | 105s |
+| TQ3/TQ3 generic FA | 37.6 | 64% | 164s |
+| **TQ3/TQ3 IQK FA** | **55.9** | **95%** | **110s** |
+
+**IQK FA provides a 49% prefill speedup** over the generic path (55.9 vs
+37.6 tok/s). TQ3_0 IQK FA runs at **95% of F16 speed** — exceeding the
+85-90% target from TQ3PLAN.md.
+
+Decode speed: 5.82 tok/s (IQK FA) vs 5.96 tok/s (generic) — within noise,
+both bottlenecked by weight matmuls not KV cache reads at this model size.
+
+### 12.6 Cross-Architecture Validation (TQ3_0 IQK FA, 5 Models)
+
+Tested TQ3_0 IQK FA on all 5 architectures from Phase 2b (3-chunk PPL,
+AVX2, CPU-only). No crashes on any model — the IQK kernel is stable across
+all architectures.
+
+| Model | Architecture | head_dim | F16 PPL | TQ3 IQK PPL | Delta | TQ3 Safe? |
+|-------|-------------|----------|---------|-------------|-------|-----------|
+| Qwen 3.5-9B | Hybrid (Mamba+attn) | 256 | 7.91 | 8.04 | **+0.13** | Yes |
+| Qwen 3.5-4B | Hybrid (Mamba+attn) | 128 | 9.77 | 9.91 | **+0.14** | Yes |
+| Gemma 3 4B | Dense (Google) | 256 | 15.91 | 15.80 | **-0.11** | Yes (improves) |
+| Llama 3.2 3B | Dense (Meta) | 128 | 11.93 | 12.65 | **+0.72** | Marginal |
+| Qwen3 4B | Dense (old Alibaba) | 128 | 14.00 | 18.88 | **+4.88** | **No** |
+
+**Comparison with Phase 2b full-run results (145 chunks):**
+
+| Model | Phase 2b TQ3/TQ3 Delta | Phase 3b IQK Delta (3-chunk) | Consistent? |
+|-------|----------------------|----------------------------|-------------|
+| Qwen 3.5-9B | +0.088 | +0.13 | Yes |
+| Qwen 3.5-4B | +0.122 | +0.14 | Yes |
+| Gemma 3 4B | -0.102 | -0.11 | Yes (improves) |
+| Llama 3.2 3B | +0.596 | +0.72 | Yes (3-chunk noisier) |
+| Qwen3 4B | +3.325 | +4.88 | Yes (broken) |
+
+All results are directionally consistent with Phase 2b. The 3-chunk estimates
+have higher variance but confirm the same architecture-dependent pattern.
+
+**Key findings:**
+
+1. **Gemma 3 consistently improves with TQ3** — PPL *decreases* by 0.11.
+   Gemma 3 uses head_dim=256, which provides a more forgiving quantization
+   environment (the Beta distribution converges faster to Gaussian at higher d,
+   and the Hadamard rotation spreads outlier energy more uniformly across 256
+   dimensions). This is also the regime where QJL could become competitive
+   (overhead 1.125 bits vs 1.5 at head_dim=64).
+
+2. **Qwen 3.5 hybrid arch remains robust** — +0.13 to +0.14 across both 4B
+   and 9B model sizes. Mamba layers process sequences without KV caches,
+   reducing the fraction of computation affected by quantization.
+
+3. **Llama 3.2 is the most TQ3-sensitive modern arch** — +0.72 at 3 chunks,
+   consistent with +0.596 at 145 chunks. TQ4 recommended for Llama family.
+
+4. **Qwen3 old arch still broken** — +4.88 delta, incoherent generation
+   ("The capital of Paris is 10"). TQ4 must be used on this architecture.
+
+5. **IQK kernel is architecture-agnostic** — no crashes, no quality regression
+   vs generic FA on any of the 5 models tested. The quality differences are
+   entirely due to the 3-bit quantization, not the kernel implementation.
+
+---
+
 ## References
 
 1. Zandieh et al. "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." arXiv:2504.19874 (2025). Google Research.
