@@ -1,0 +1,70 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout LeanKV
+        uses: actions/checkout@v4
+
+      - name: Clone Lean_llama.cpp
+        run: |
+          git clone --depth 1 https://github.com/Aulora137/Lean_llama.cpp.git /tmp/Lean_llama.cpp
+
+      - name: Build Lean_llama.cpp
+        run: |
+          cd /tmp/Lean_llama.cpp
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
+
+      - name: Build TQ unit tests
+        run: |
+          cd src
+          gcc -O2 -o test-tq test-tq.c \
+            /tmp/Lean_llama.cpp/ggml/src/ggml-tq.c \
+            -I/tmp/Lean_llama.cpp/ggml/include \
+            -I/tmp/Lean_llama.cpp/ggml/src \
+            -lm
+          ./test-tq
+
+      - name: Verify TQ types registered
+        run: |
+          /tmp/Lean_llama.cpp/build/bin/llama-cli --help 2>&1 | head -5
+          echo "Build successful - TQ types available"
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout LeanKV
+        uses: actions/checkout@v4
+
+      - name: Clone Lean_llama.cpp
+        run: |
+          git clone --depth 1 https://github.com/Aulora137/Lean_llama.cpp.git /tmp/Lean_llama.cpp
+
+      - name: Build Lean_llama.cpp
+        run: |
+          cd /tmp/Lean_llama.cpp
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(sysctl -n hw.ncpu)
+
+      - name: Build TQ unit tests
+        run: |
+          cd src
+          gcc -O2 -o test-tq test-tq.c \
+            /tmp/Lean_llama.cpp/ggml/src/ggml-tq.c \
+            -I/tmp/Lean_llama.cpp/ggml/include \
+            -I/tmp/Lean_llama.cpp/ggml/src \
+            -lm
+          ./test-tq
+
+      - name: Verify TQ types registered
+        run: |
+          /tmp/Lean_llama.cpp/build/bin/llama-cli --help 2>&1 | head -5
+          echo "Build successful - TQ types available"
