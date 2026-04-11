@@ -1,0 +1,5 @@
+chip=Apple M2
+memory_gb=16
+cores=8
+p_cores=4
+e_cores=4
