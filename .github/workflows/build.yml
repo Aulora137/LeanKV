@@ -15,7 +15,7 @@ jobs:
 
       - name: Clone Lean_llama.cpp
         run: |
-          git clone --depth 1 https://github.com/Aulora137/Lean_llama.cpp.git /tmp/Lean_llama.cpp
+          git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/Aulora137/Lean_llama.cpp.git /tmp/Lean_llama.cpp
 
       - name: Build Lean_llama.cpp
         run: |
@@ -46,7 +46,7 @@ jobs:
 
       - name: Clone Lean_llama.cpp
         run: |
-          git clone --depth 1 https://github.com/Aulora137/Lean_llama.cpp.git /tmp/Lean_llama.cpp
+          git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/Aulora137/Lean_llama.cpp.git /tmp/Lean_llama.cpp
 
       - name: Build Lean_llama.cpp
         run: |
