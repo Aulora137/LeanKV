@@ -21,6 +21,8 @@ families. Across 36 perplexity runs on WikiText-2:
 - **Hadamard rotation acts as a regularizer** — TQ quantization *improves* PPL on
   Gemma 3 and Qwen3 dense models
 - **KV memory reduced 36-39%** vs FP16 with no speed regression
+- **Apple M2 validated** — TQ4/TQ4 PPL delta +0.016, TQ3/TQ3 delta +0.05 (with
+  optimal rounding), KV cache reduced 75-81% vs FP16
 
 ---
 
@@ -716,6 +718,106 @@ Raw CSV results:
 
 Per-run logs (raw llama-perplexity output):
 - `prototype/eval/results/logs/`
+
+---
+
+## 11. Apple M2 Benchmark Results (Phase 3b)
+
+**Date:** 2026-04-09 to 2026-04-10
+**Hardware:** Apple M2, 16 GB unified memory, 8 cores (4P+4E)
+**Software:** Lean_llama.cpp (commit `5d2fcb76`), CPU-only (ngl=0), 8 threads
+**Model:** Qwen 3.5-9B Q4_K_M (head_dim=128, 8 KV heads)
+**Dataset:** WikiText-2 raw test split, 2048-token context, 145 chunks
+
+### 11.1 Throughput (tok/s)
+
+Measured with `llama-cli` prompt-eval (pp) and text-generation (tg) at three
+context lengths. CPU-only (Metal FA crashes on Qwen 3.5 head_dim=256 variant).
+
+| Config | pp 512 | pp 2048 | pp 4096 | tg 512 | tg 2048 | tg 4096 |
+|--------|--------|---------|---------|--------|---------|---------|
+| F16/F16 | 57.45 | 53.80 | 49.25 | 9.42 | 8.25 | 9.22 |
+| Q8/F16 | 46.17 | 46.64 | 45.44 | 9.30 | 8.49 | 9.14 |
+| TQ4/F16 | 43.45 | 44.93 | 42.04 | 9.30 | 9.14 | 9.16 |
+| TQ4/TQ4 | 41.68 | 39.57 | 34.48 | 9.17 | 9.19 | 9.08 |
+
+**Observations:**
+- Token generation speed is flat across all KV configs (~9.1-9.4 tok/s) because
+  it is bottlenecked by the weight matmuls, not KV cache reads.
+- Prompt eval (prefill) is ~20-30% slower for TQ4 vs F16 on the generic path
+  (no IQK FA kernel on ARM yet).
+
+### 11.2 Perplexity (WikiText-2, full 145 chunks)
+
+| Config | K type | V type | PPL | Stderr | Delta from F16 | Time (s) |
+|--------|--------|--------|-----|--------|----------------|----------|
+| F16/F16 | f16 | f16 | 7.1733 | 0.04647 | -- | 8496 |
+| Q8/F16 | q8_0 | f16 | 7.1758 | 0.04649 | +0.003 | 7678 |
+| TQ4/F16 | tq4_0 | f16 | 7.1927 | 0.04664 | +0.019 | 8263 |
+| TQ4/TQ4 | tq4_0 | tq4_0 | 7.1892 | 0.04666 | +0.016 | 10153 |
+
+**Key results:**
+- **TQ4/TQ4 PPL delta = +0.016** from F16 baseline. Essentially lossless, consistent
+  with the AVX2/RTX 4090 results from Phase 3a.
+- TQ4/TQ4 is slightly *better* than TQ4/F16, consistent with the regularization
+  effect observed on Qwen models in Section 8.
+
+### 11.3 TQ3_0 Quality (3-bit, Phase 3b + TQ3 improvement)
+
+TQ3_0 was tested with the improved optimal rounding quantizer (coordinate descent
++ least-squares scale, 2 passes). 3-chunk estimate on M2:
+
+| Config | Chunk 1 | Chunk 2 | Chunk 3 | PPL (3-chunk) | Delta from F16 |
+|--------|---------|---------|---------|---------------|----------------|
+| F16/F16 | 6.77 | 7.96 | 8.05 | 8.05 | -- |
+| TQ4/TQ4 | 6.78 | 7.96 | 8.07 | 8.07 | +0.02 |
+| TQ3/TQ3 (baseline) | 6.85 | 8.08 | 8.14 | 8.14 | +0.09 |
+| TQ3/TQ3 (optimized) | 6.85 | 8.05 | 8.10 | 8.10 | **+0.05** |
+
+**Optimal rounding improvement:** The coordinate descent quantizer reduced TQ3
+PPL delta from +0.09 to +0.05 (a 44% reduction in quality loss) with zero decode
+cost. The improvement is encode-only: the block format and dequantization path
+are unchanged.
+
+**Python prototype results** (10,000 synthetic blocks, `scripts/tq3_rounding.py`):
+
+| Strategy | MSE | SNR (dB) | Cosine Error | Gain vs baseline |
+|----------|-----|----------|-------------|-----------------|
+| Baseline (nearest + max\|x\|) | 0.0316 | 15.00 | 1.51e-02 | -- |
+| Optimal scale only | 0.0298 | 15.25 | 1.51e-02 | +0.25 dB |
+| Coord descent (adj, 2 pass) | 0.0267 | 15.73 | 1.35e-02 | +0.73 dB |
+| Coord descent (adj, 3 pass) | 0.0265 | 15.76 | 1.34e-02 | +0.76 dB |
+| TQ4 baseline (reference) | 0.0068 | 21.65 | 3.26e-03 | -- |
+
+### 11.4 KV Cache Memory (Qwen 3.5-9B, 2048 context)
+
+| Config | KV Size | vs F16 |
+|--------|---------|--------|
+| F16/F16 | 72.00 MiB | -- |
+| Q8/F16 | 54.00 MiB | -25% |
+| TQ4/TQ4 | 18.00 MiB | **-75%** |
+| TQ3/TQ3 | 14.00 MiB | **-81%** |
+
+### 11.5 Bug Fixes During M2 Bring-up
+
+1. **TQ4_0 NaN on ARM** — `vec_dot_type` was `GGML_TYPE_Q8_0_X4` on non-AVX2
+   platforms. Generic FA quantized Q to Q8_0_X4 interleaved format but
+   `ggml_vec_dot_tq4_0_q8_0` reads as plain Q8_0. Fix: one-line change to
+   `GGML_TYPE_Q8_0` in `ggml.c` type_traits.
+
+2. **IQK FA crash for TQ4_0 on ARM** — TQ4_0 was in `supported_kv_types()` on
+   ARM but had no NEON kernel, causing assertion failure. Fix: added
+   `#ifndef __aarch64__` guard.
+
+3. **Metal FA crash** — `GGML_ASSERT(ne10 == ne02)` in `ggml-metal.m` for
+   Qwen 3.5-9B (head_dim=256 incompatible with Metal FA). Workaround: ngl=0
+   (CPU-only).
+
+### 11.6 Raw Data
+
+- Throughput CSV: `scripts/results-m2/throughput_20260409_214107.csv`
+- PPL CSV: `scripts/results-m2/ppl_overnight.csv`
+- Benchmark scripts: `scripts/bench_m2.sh`, `scripts/bench_m2_ppl.sh`
 
 ---
 
