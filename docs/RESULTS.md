@@ -989,6 +989,99 @@ have higher variance but confirm the same architecture-dependent pattern.
 
 ---
 
+## 13. ARM NEON IQK Kernels for TQ4/TQ3 (Phase 3c)
+
+**Date:** 2026-04-10
+**Hardware:** Apple M2, 16 GB unified memory, 8 cores (4P+4E)
+**Software:** Lean_llama.cpp (commit post-`2782ed28`), CPU-only (ngl=0)
+**Model:** Qwen 3.5-9B Q4_K_M
+
+### 13.1 Background
+
+Prior to this work, TQ4_0 and TQ3_0 on ARM fell back to the generic ggml flash
+attention path (`to_float()` + `ggml_vec_mad_f32`). The IQK flash attention
+kernels, which use SIMD-optimized dequantization fused with FMADD accumulation,
+were gated behind `#ifndef __aarch64__` guards because an earlier attempt at ARM
+IQK kernels was 12x slower (that slowdown was caused by the `vec_dot_type`
+Q8_0_X4 bug, which has since been fixed).
+
+### 13.2 Implementation
+
+**New NEON kernels added to `iqk_gemm_legacy_quants.cpp`:**
+
+1. **`DequantizerTQ3_0`** — ARM NEON dequantizer for TQ3_0 3-bit blocks.
+   Uses scalar 3-bit unpack (`unpack8()`: 4 groups of 8-in-3-bytes → 32 uint8
+   indices) followed by `vqtbl1q_s8()` codebook lookup against `tq3_values` LUT.
+   Scale applied as `vmul_f16(d, inv127)`. Modeled on the existing
+   `DequantizerTQ4_0` but with custom unpacking (can't reuse `Q4LegacyBits`
+   which assumes 4-bit nibble format).
+
+2. **`DeqTQ3_0`** — Lightweight convert helper for `iqk_convert_legacy_quants_q8_r8`.
+   Same 3-bit unpack + LUT pattern, returns `int8x16x2_t`.
+
+**Registration changes:**
+
+- `supported_kv_types()` in `iqk_flash_attn.cpp`: Removed `#ifndef __aarch64__`
+  guards. TQ4_0 and TQ3_0 now use IQK FA on all platforms.
+- `iqk_set_kernels_legacy_quants()`: Enabled `DequantizerTQ4_0` (was commented out)
+  and registered new `DequantizerTQ3_0` for ARM mul_mat.
+- `iqk_convert_legacy_quants_q8_r8()`: Added TQ3_0 convert dispatch.
+- `mul_mat_kernel()` (FA K-side): TQ3_0 now dispatches to `DequantizerTQ3_0` on
+  ARM instead of hitting `GGML_ASSERT(false)`.
+
+**Files modified:**
+- `ggml/src/iqk/iqk_flash_attn.cpp` — Remove aarch64 guards
+- `ggml/src/iqk/iqk_gemm_legacy_quants.cpp` — Add DequantizerTQ3_0, DeqTQ3_0,
+  enable TQ4/TQ3 ARM registration
+
+### 13.3 Generation Speed (tok/s)
+
+Measured with `llama-cli`, ~370 token prompt, 32 token generation, 2048 context.
+
+| Config | Prefill (tok/s) | Generation (tok/s) | Gen vs F16 |
+|--------|----------------|-------------------|------------|
+| F16/F16 | 49.97 | 10.95 | -- |
+| TQ4/TQ4 (IQK FA) | 47.26 | **10.87** | **99.3%** |
+| TQ3/TQ3 (IQK FA) | 44.68 | **10.60** | **96.8%** |
+
+**Comparison with prior generic path (from Section 11.1):**
+
+| Config | Generic (tok/s) | IQK FA (tok/s) | Speedup |
+|--------|----------------|----------------|---------|
+| TQ4/TQ4 generation | ~9.2 | 10.87 | **+18%** |
+| TQ3/TQ3 generation | 1.82 | 10.60 | **+482% (5.8x)** |
+
+The TQ3 speedup is dramatic because the generic path's scalar 3-bit unpacking
+in `dequantize_row_tq3_0()` was extremely slow. The IQK kernel amortizes the
+unpack cost across the fused dequant-FMADD pipeline.
+
+### 13.4 Perplexity Verification (3 chunks)
+
+| Config | Chunk 1 | Chunk 2 | Chunk 3 | PPL (3-chunk) | Delta from F16 |
+|--------|---------|---------|---------|---------------|----------------|
+| TQ4/TQ4 (generic) | 6.78 | 7.96 | 8.07 | 8.07 | +0.02 |
+| TQ4/TQ4 (IQK FA) | 6.79 | 7.98 | 8.08 | 8.08 | +0.03 |
+| TQ3/TQ3 (generic) | 6.85 | 8.05 | 8.10 | 8.10 | +0.05 |
+| TQ3/TQ3 (IQK FA) | 6.85 | 8.05 | 8.11 | 8.11 | +0.06 |
+
+**No quality regression.** IQK FA produces PPL within noise of the generic path
+for both TQ4 and TQ3. The IQK kernel is a pure speed optimization with no
+quality impact.
+
+### 13.5 Summary: TQ3/TQ4 on Apple M2
+
+| Metric | TQ4/TQ4 | TQ3/TQ3 |
+|--------|---------|---------|
+| Generation speed | 10.87 tok/s (99% of F16) | 10.60 tok/s (97% of F16) |
+| PPL delta from F16 | +0.016 (145 chunks) | +0.05 (3-chunk est.) |
+| KV memory | 18 MiB (-75%) | 14 MiB (-81%) |
+| Bits per element | 4.5 | 3.5 |
+
+Both TQ4 and TQ3 are now production-ready on Apple Silicon with IQK acceleration:
+near-F16 speed, near-F16 quality, and 75-81% KV memory reduction.
+
+---
+
 ## References
 
 1. Zandieh et al. "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." arXiv:2504.19874 (2025). Google Research.
