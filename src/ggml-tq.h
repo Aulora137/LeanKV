@@ -71,6 +71,7 @@ static inline float ggml_fp16_to_fp32(ggml_half h) {
 
 /* ── Block sizes ───────────────────────────────────────────────────── */
 
+#define QK_TQ2 32   /* elements per TQ2 block */
 #define QK_TQ3 32   /* elements per TQ3 block */
 #define QK_TQ4 32   /* elements per TQ4 block */
 
@@ -83,6 +84,15 @@ static inline float ggml_fp16_to_fp32(ggml_half h) {
  * The non-uniform spacing (denser near zero) is provably optimal
  * for Gaussian distributions (minimizes MSE).
  * ──────────────────────────────────────────────────────────────────── */
+
+/* 2-bit: 4 levels, 3 boundaries */
+static const float TQ2_LEVELS[4] = {
+    -1.0000000f, -0.2997714f, +0.2997714f, +1.0000000f,
+};
+
+static const float TQ2_BOUNDARIES[3] = {
+    -0.6498857f, +0.0000000f, +0.6498857f,
+};
 
 /* 3-bit: 8 levels, 7 boundaries */
 static const float TQ3_LEVELS[8] = {
@@ -114,6 +124,12 @@ static const float TQ4_BOUNDARIES[15] = {
 
 typedef struct {
     ggml_half d;            /* per-block scale factor (2 bytes)  */
+    uint8_t  qs[QK_TQ2/4];  /* 32 × 2-bit packed indices (8 bytes) */
+} block_tq2_0;
+/* 10 bytes per 32 elements = 2.5 bits/elem */
+
+typedef struct {
+    ggml_half d;            /* per-block scale factor (2 bytes)  */
     uint8_t  qs[12];        /* 32 × 3-bit packed indices (12 bytes) */
 } block_tq3_0;
 /* 14 bytes per 32 elements = 3.5 bits/elem */
@@ -126,6 +142,9 @@ typedef struct {
 
 /* ── Quantize / dequantize ─────────────────────────────────────────── */
 
+void quantize_row_tq2_0_ref(const float * restrict x, block_tq2_0 * restrict y, int64_t k);
+void dequantize_row_tq2_0  (const block_tq2_0 * restrict x, float * restrict y, int64_t k);
+
 void quantize_row_tq3_0_ref(const float * restrict x, block_tq3_0 * restrict y, int64_t k);
 void dequantize_row_tq3_0  (const block_tq3_0 * restrict x, float * restrict y, int64_t k);
 
@@ -133,8 +152,15 @@ void quantize_row_tq4_0_ref(const float * restrict x, block_tq4_0 * restrict y, 
 void dequantize_row_tq4_0  (const block_tq4_0 * restrict x, float * restrict y, int64_t k);
 
 /* Wrappers matching ggml from_float signature: void (*)(const float *, void *, int64_t) */
+void quantize_row_tq2_0(const float * restrict x, void * restrict y, int64_t k);
 void quantize_row_tq3_0(const float * restrict x, void * restrict y, int64_t k);
 void quantize_row_tq4_0(const float * restrict x, void * restrict y, int64_t k);
+
+/* ── Requantize (for tiered cache migration) ─────────────────────── */
+
+void requantize_tq4_to_tq3(const block_tq4_0 * restrict src, block_tq3_0 * restrict dst, int64_t k);
+void requantize_tq3_to_tq2(const block_tq3_0 * restrict src, block_tq2_0 * restrict dst, int64_t k);
+void requantize_tq4_to_tq2(const block_tq4_0 * restrict src, block_tq2_0 * restrict dst, int64_t k);
 
 /* ── Hadamard transform ────────────────────────────────────────────── */
 
