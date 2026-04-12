@@ -19,12 +19,19 @@
  *  15. TQ2 vs uniform 2-bit
  *  16. Requantize TQ4→TQ3→TQ2 chain
  *  17. TQ2 memory layout
+ *  18. Outlier detection and permutation
+ *  19. Mixed-precision quantize/dequantize quality
+ *  20. Mixed-precision vs uniform TQ2 quality
+ *  21. Mixed-precision effective bits
+ *  22. Outlier + Hadamard full pipeline
+ *  23. Mixed-precision attention preservation
  */
 
 #ifndef GGML_TQ_STANDALONE
 #define GGML_TQ_STANDALONE
 #endif
 #include "ggml-tq.h"
+#include "ggml-tq-outlier.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1014,11 +1021,513 @@ static void test_tq2_memory_layout(void) {
     CHECK(QK_TQ4 == 32, "QK_TQ4 = 32 (got %d)", QK_TQ4);
 }
 
+/* ── Test 18: Outlier detection and permutation ───────────────────── */
+
+static void test_outlier_detection(void) {
+    printf("\n=== Test 18: Outlier detection and permutation ===\n");
+
+    const int head_dim = 64;
+    const int n_tokens = 256;
+
+    /* Generate calibration data with known outlier channels */
+    float * calib = (float *)malloc(n_tokens * head_dim * sizeof(float));
+    uint32_t rng = 11111;
+
+    for (int t = 0; t < n_tokens; t++) {
+        for (int d = 0; d < head_dim; d++) {
+            calib[t * head_dim + d] = rand_normal(&rng) * 0.1f;
+        }
+        /* Make channels 0, 7, 15, 31 have 10x higher variance */
+        calib[t * head_dim +  0] = rand_normal(&rng) * 1.0f;
+        calib[t * head_dim +  7] = rand_normal(&rng) * 1.0f;
+        calib[t * head_dim + 15] = rand_normal(&rng) * 1.0f;
+        calib[t * head_dim + 31] = rand_normal(&rng) * 1.0f;
+    }
+
+    tq_outlier_config config;
+    tq_identify_outliers(&config, calib, n_tokens, head_dim, 0.25f,
+                         TQ_TIER_TQ3, TQ_TIER_TQ2);
+
+    printf("  head_dim=%d, n_outlier=%d, n_normal=%d\n",
+           config.head_dim, config.n_outlier, config.n_normal);
+
+    /* n_outlier should be rounded to multiple of 32 */
+    CHECK(config.n_outlier % 32 == 0,
+          "n_outlier is multiple of 32 (got %d)", config.n_outlier);
+    CHECK(config.n_outlier + config.n_normal == head_dim,
+          "n_outlier + n_normal = head_dim (%d + %d = %d)",
+          config.n_outlier, config.n_normal, config.n_outlier + config.n_normal);
+
+    /* The 4 injected outlier channels should be in the outlier set (first n_outlier positions) */
+    int outlier_channels[] = {0, 7, 15, 31};
+    int found = 0;
+    for (int c = 0; c < 4; c++) {
+        if (config.inv_perm[outlier_channels[c]] < config.n_outlier) {
+            found++;
+        }
+    }
+    CHECK(found >= 3,
+          "At least 3/4 injected outliers detected (got %d/4)", found);
+
+    /* Verify permutation is a valid permutation (bijection) */
+    int * seen = (int *)calloc(head_dim, sizeof(int));
+    int valid_perm = 1;
+    for (int i = 0; i < head_dim; i++) {
+        int p = config.perm[i];
+        if (p < 0 || p >= head_dim || seen[p]) {
+            valid_perm = 0;
+            break;
+        }
+        seen[p] = 1;
+    }
+    CHECK(valid_perm, "Permutation is a valid bijection");
+
+    /* Verify inv_perm is actually the inverse */
+    int inverse_ok = 1;
+    for (int i = 0; i < head_dim; i++) {
+        if (config.inv_perm[config.perm[i]] != i) {
+            inverse_ok = 0;
+            break;
+        }
+    }
+    CHECK(inverse_ok, "inv_perm is the inverse of perm");
+
+    /* Verify outlier channels have higher variance than normal */
+    float max_normal_var = 0.0f, min_outlier_var = 1e30f;
+    for (int i = 0; i < config.n_outlier; i++) {
+        float v = config.channel_var[config.perm[i]];
+        if (v < min_outlier_var) min_outlier_var = v;
+    }
+    for (int i = config.n_outlier; i < head_dim; i++) {
+        float v = config.channel_var[config.perm[i]];
+        if (v > max_normal_var) max_normal_var = v;
+    }
+    CHECK(min_outlier_var >= max_normal_var,
+          "All outlier variances >= all normal variances (%.4f >= %.4f)",
+          min_outlier_var, max_normal_var);
+
+    free(calib);
+    free(seen);
+}
+
+/* ── Test 19: Mixed-precision quantize/dequantize quality ─────────── */
+
+static void test_mixed_precision_quality(void) {
+    printf("\n=== Test 19: Mixed-precision quantize/dequantize quality ===\n");
+
+    const int head_dim = 128;
+    const int n_tokens = 256;
+
+    /* Generate calibration data with outlier channels */
+    float * calib = (float *)malloc(n_tokens * head_dim * sizeof(float));
+    uint32_t rng = 22222;
+    for (int t = 0; t < n_tokens; t++) {
+        for (int d = 0; d < head_dim; d++) {
+            calib[t * head_dim + d] = rand_normal(&rng) * 0.1f;
+        }
+        /* Inject outliers in ~25% of channels */
+        for (int d = 0; d < 32; d++) {
+            int ch = (d * 4 + 1) % head_dim;
+            calib[t * head_dim + ch] = rand_normal(&rng) * 1.0f;
+        }
+    }
+
+    /* Detect outliers */
+    tq_outlier_config config;
+    tq_identify_outliers(&config, calib, n_tokens, head_dim, 0.25f,
+                         TQ_TIER_TQ3, TQ_TIER_TQ2);
+
+    printf("  Config: %d outlier channels (TQ3), %d normal (TQ2)\n",
+           config.n_outlier, config.n_normal);
+
+    /* Allocate mixed-precision buffers */
+    size_t outlier_sz, normal_sz;
+    tq_mixed_buffer_sizes(&config, &outlier_sz, &normal_sz);
+    void * outlier_buf = malloc(outlier_sz);
+    void * normal_buf  = malloc(normal_sz);
+
+    /* Test on a single head's data */
+    float * original = calib;  /* use first token as test data */
+    float restored[256];
+
+    tq_mixed_quantize(original, &config, outlier_buf, normal_buf);
+    tq_mixed_dequantize(outlier_buf, normal_buf, &config, restored);
+
+    float mse_mixed = compute_mse(original, restored, head_dim);
+    float cos_mixed = compute_cosine_sim(original, restored, head_dim);
+
+    /* Compare with uniform TQ2 on same data */
+    float uniform_restored[256];
+    int nb = head_dim / QK_TQ2;
+    block_tq2_0 * tq2_blocks = (block_tq2_0 *)malloc(nb * sizeof(block_tq2_0));
+    quantize_row_tq2_0_ref(original, tq2_blocks, head_dim);
+    dequantize_row_tq2_0(tq2_blocks, uniform_restored, head_dim);
+
+    float mse_uniform = compute_mse(original, uniform_restored, head_dim);
+    float cos_uniform = compute_cosine_sim(original, uniform_restored, head_dim);
+
+    printf("  Mixed TQ3+TQ2:  MSE=%.8f  Cosine=%.6f\n", mse_mixed, cos_mixed);
+    printf("  Uniform TQ2:    MSE=%.8f  Cosine=%.6f\n", mse_uniform, cos_uniform);
+    printf("  Improvement:    %.1f%% lower MSE\n",
+           mse_uniform > 0 ? (1.0f - mse_mixed / mse_uniform) * 100.0f : 0.0f);
+
+    CHECK(mse_mixed < mse_uniform,
+          "Mixed-precision beats uniform TQ2 (%.2e < %.2e)",
+          mse_mixed, mse_uniform);
+    CHECK(cos_mixed > cos_uniform,
+          "Mixed-precision cosine > uniform TQ2 (%.4f > %.4f)",
+          cos_mixed, cos_uniform);
+
+    free(calib);
+    free(outlier_buf);
+    free(normal_buf);
+    free(tq2_blocks);
+}
+
+/* ── Test 20: Mixed vs uniform TQ2 on many samples ───────────────── */
+
+static void test_mixed_vs_uniform(void) {
+    printf("\n=== Test 20: Mixed-precision vs uniform TQ2 (multi-sample) ===\n");
+
+    const int head_dim = 128;
+    const int n_tokens = 512;
+
+    float * calib = (float *)malloc(n_tokens * head_dim * sizeof(float));
+    uint32_t rng = 33333;
+
+    /* Generate data with structured outliers */
+    for (int t = 0; t < n_tokens; t++) {
+        for (int d = 0; d < head_dim; d++) {
+            calib[t * head_dim + d] = rand_normal(&rng) * 0.1f;
+        }
+        for (int d = 0; d < 32; d++) {
+            int ch = (d * 4 + 1) % head_dim;
+            calib[t * head_dim + ch] = rand_normal(&rng) * 1.0f;
+        }
+    }
+
+    tq_outlier_config config;
+    tq_identify_outliers(&config, calib, n_tokens, head_dim, 0.25f,
+                         TQ_TIER_TQ3, TQ_TIER_TQ2);
+
+    size_t outlier_sz, normal_sz;
+    tq_mixed_buffer_sizes(&config, &outlier_sz, &normal_sz);
+    void * outlier_buf = malloc(outlier_sz);
+    void * normal_buf  = malloc(normal_sz);
+
+    /* Aggregate MSE over many tokens */
+    double total_mse_mixed = 0.0, total_mse_uniform = 0.0;
+    int n_test = 100;
+    block_tq2_0 * tq2_blocks = (block_tq2_0 *)malloc((head_dim / QK_TQ2) * sizeof(block_tq2_0));
+    float restored_m[256], restored_u[256];
+
+    for (int t = 0; t < n_test; t++) {
+        const float * row = calib + t * head_dim;
+
+        tq_mixed_quantize(row, &config, outlier_buf, normal_buf);
+        tq_mixed_dequantize(outlier_buf, normal_buf, &config, restored_m);
+
+        quantize_row_tq2_0_ref(row, tq2_blocks, head_dim);
+        dequantize_row_tq2_0(tq2_blocks, restored_u, head_dim);
+
+        total_mse_mixed   += compute_mse(row, restored_m, head_dim);
+        total_mse_uniform += compute_mse(row, restored_u, head_dim);
+    }
+
+    float avg_mse_mixed   = (float)(total_mse_mixed / n_test);
+    float avg_mse_uniform = (float)(total_mse_uniform / n_test);
+    float improvement = (1.0f - avg_mse_mixed / avg_mse_uniform) * 100.0f;
+
+    printf("  Avg MSE mixed:   %.8f\n", avg_mse_mixed);
+    printf("  Avg MSE uniform: %.8f\n", avg_mse_uniform);
+    printf("  Improvement:     %.1f%%\n", improvement);
+
+    CHECK(avg_mse_mixed < avg_mse_uniform,
+          "Mixed avg MSE < uniform avg MSE over %d samples", n_test);
+
+    free(calib);
+    free(outlier_buf);
+    free(normal_buf);
+    free(tq2_blocks);
+}
+
+/* ── Test 21: Mixed-precision effective bits ──────────────────────── */
+
+static void test_mixed_effective_bits(void) {
+    printf("\n=== Test 21: Mixed-precision effective bits ===\n");
+
+    tq_outlier_config config;
+
+    /* 25% outlier TQ3 + TQ2: (32*3.5 + 96*2.5) / 128 = 2.75 */
+    config.head_dim = 128;
+    config.n_outlier = 32;
+    config.n_normal = 96;
+    config.outlier_tier = TQ_TIER_TQ3;
+    config.normal_tier = TQ_TIER_TQ2;
+    float bpe = tq_mixed_effective_bpe(&config);
+    printf("  TQ3+TQ2 (25%% outlier): %.2f bits/elem\n", bpe);
+    CHECK(fabsf(bpe - 2.75f) < 0.01f,
+          "TQ3+TQ2 25%% = 2.75 bpe (got %.2f)", bpe);
+
+    /* 25% outlier TQ4 + TQ3: (32*4.5 + 96*3.5) / 128 = 3.75 */
+    config.outlier_tier = TQ_TIER_TQ4;
+    config.normal_tier = TQ_TIER_TQ3;
+    bpe = tq_mixed_effective_bpe(&config);
+    printf("  TQ4+TQ3 (25%% outlier): %.2f bits/elem\n", bpe);
+    CHECK(fabsf(bpe - 3.75f) < 0.01f,
+          "TQ4+TQ3 25%% = 3.75 bpe (got %.2f)", bpe);
+
+    /* 25% outlier TQ4 + TQ2: (32*4.5 + 96*2.5) / 128 = 3.00 */
+    config.outlier_tier = TQ_TIER_TQ4;
+    config.normal_tier = TQ_TIER_TQ2;
+    bpe = tq_mixed_effective_bpe(&config);
+    printf("  TQ4+TQ2 (25%% outlier): %.2f bits/elem\n", bpe);
+    CHECK(fabsf(bpe - 3.00f) < 0.01f,
+          "TQ4+TQ2 25%% = 3.00 bpe (got %.2f)", bpe);
+
+    /* Buffer sizes should be consistent */
+    size_t outlier_sz, normal_sz;
+    config.outlier_tier = TQ_TIER_TQ3;
+    config.normal_tier = TQ_TIER_TQ2;
+    tq_mixed_buffer_sizes(&config, &outlier_sz, &normal_sz);
+    /* 32 outlier channels / 32 per block = 1 TQ3 block = 14 bytes */
+    /* 96 normal channels / 32 per block = 3 TQ2 blocks = 30 bytes */
+    printf("  Buffer sizes: outlier=%zu, normal=%zu, total=%zu bytes for %d elem\n",
+           outlier_sz, normal_sz, outlier_sz + normal_sz, config.head_dim);
+    CHECK(outlier_sz == 1 * sizeof(block_tq3_0),
+          "Outlier buffer = 1 TQ3 block (%zu bytes)", outlier_sz);
+    CHECK(normal_sz == 3 * sizeof(block_tq2_0),
+          "Normal buffer = 3 TQ2 blocks (%zu bytes)", normal_sz);
+}
+
+/* ── Test 22: Outlier + Hadamard full pipeline ────────────────────── */
+
+static void test_outlier_hadamard_pipeline(void) {
+    printf("\n=== Test 22: Outlier + Hadamard full pipeline ===\n");
+
+    const int head_dim = 64;
+    const int n_heads = 4;
+    const int n = head_dim * n_heads;
+    const int n_calib = 256;
+
+    /* Generate calibration data with outliers */
+    float * calib = (float *)malloc(n_calib * head_dim * sizeof(float));
+    uint32_t rng = 44444;
+    for (int t = 0; t < n_calib; t++) {
+        for (int d = 0; d < head_dim; d++) {
+            calib[t * head_dim + d] = rand_normal(&rng) * 0.1f;
+        }
+        for (int d = 0; d < 16; d++) {
+            int ch = (d * 4 + 1) % head_dim;
+            calib[t * head_dim + ch] = rand_normal(&rng) * 2.0f;
+        }
+    }
+
+    /* Detect outliers */
+    tq_outlier_config config;
+    tq_identify_outliers(&config, calib, n_calib, head_dim, 0.25f,
+                         TQ_TIER_TQ3, TQ_TIER_TQ2);
+
+    size_t outlier_sz, normal_sz;
+    tq_mixed_buffer_sizes(&config, &outlier_sz, &normal_sz);
+
+    /* Generate test data (one token with n_heads heads) */
+    float * original = (float *)malloc(n * sizeof(float));
+    for (int i = 0; i < n; i++) {
+        original[i] = rand_normal(&rng) * 0.1f;
+    }
+    /* Inject outliers matching calibration */
+    for (int h = 0; h < n_heads; h++) {
+        for (int d = 0; d < 16; d++) {
+            int ch = (d * 4 + 1) % head_dim;
+            original[h * head_dim + ch] = rand_normal(&rng) * 2.0f;
+        }
+    }
+
+    /* Full pipeline: Hadamard → permute → mixed quantize → dequantize → unpermute → inverse Hadamard */
+    float * rotated = (float *)malloc(n * sizeof(float));
+    float * restored = (float *)malloc(n * sizeof(float));
+    memcpy(rotated, original, n * sizeof(float));
+
+    /* Step 1: Hadamard per head */
+    hadamard_transform_row(rotated, n, head_dim);
+
+    /* Step 2: Mixed quantize/dequantize per head */
+    void * obuf = malloc(outlier_sz);
+    void * nbuf = malloc(normal_sz);
+    float * dequant = (float *)malloc(n * sizeof(float));
+
+    for (int h = 0; h < n_heads; h++) {
+        tq_mixed_quantize(rotated + h * head_dim, &config, obuf, nbuf);
+        tq_mixed_dequantize(obuf, nbuf, &config, dequant + h * head_dim);
+    }
+
+    /* Step 3: Inverse Hadamard */
+    memcpy(restored, dequant, n * sizeof(float));
+    hadamard_transform_row(restored, n, head_dim);
+
+    float mse_pipeline = compute_mse(original, restored, n);
+    float cos_pipeline = compute_cosine_sim(original, restored, n);
+
+    /* Compare with uniform TQ2 (no outlier treatment) */
+    float * restored_uniform = (float *)malloc(n * sizeof(float));
+    float * rotated2 = (float *)malloc(n * sizeof(float));
+    memcpy(rotated2, original, n * sizeof(float));
+    hadamard_transform_row(rotated2, n, head_dim);
+
+    int nb = n / QK_TQ2;
+    block_tq2_0 * tq2_blocks = (block_tq2_0 *)malloc(nb * sizeof(block_tq2_0));
+    quantize_row_tq2_0_ref(rotated2, tq2_blocks, n);
+    float * dequant2 = (float *)malloc(n * sizeof(float));
+    dequantize_row_tq2_0(tq2_blocks, dequant2, n);
+    memcpy(restored_uniform, dequant2, n * sizeof(float));
+    hadamard_transform_row(restored_uniform, n, head_dim);
+
+    float mse_uniform = compute_mse(original, restored_uniform, n);
+    float cos_uniform = compute_cosine_sim(original, restored_uniform, n);
+
+    printf("  Mixed TQ3+TQ2 pipeline: MSE=%.8f  Cosine=%.6f\n", mse_pipeline, cos_pipeline);
+    printf("  Uniform TQ2 pipeline:   MSE=%.8f  Cosine=%.6f\n", mse_uniform, cos_uniform);
+    printf("  Effective bpe: %.2f (mixed) vs 2.50 (uniform)\n",
+           tq_mixed_effective_bpe(&config));
+
+    CHECK(mse_pipeline < mse_uniform,
+          "Mixed pipeline MSE < uniform pipeline MSE (%.2e < %.2e)",
+          mse_pipeline, mse_uniform);
+    CHECK(cos_pipeline > 0.90f,
+          "Mixed pipeline cosine > 0.90 (got %.4f)", cos_pipeline);
+
+    free(calib); free(original); free(rotated); free(restored);
+    free(obuf); free(nbuf); free(dequant);
+    free(restored_uniform); free(rotated2); free(tq2_blocks); free(dequant2);
+}
+
+/* ── Test 23: Mixed-precision attention preservation ──────────────── */
+
+static void test_mixed_attention_preservation(void) {
+    printf("\n=== Test 23: Mixed-precision attention preservation ===\n");
+
+    const int head_dim = 64;
+    const int seq_len = 128;
+    const int n_calib = 256;
+
+    /* Generate calibration data */
+    float * calib = (float *)malloc(n_calib * head_dim * sizeof(float));
+    uint32_t rng = 55555;
+    for (int t = 0; t < n_calib; t++) {
+        for (int d = 0; d < head_dim; d++) {
+            calib[t * head_dim + d] = rand_normal(&rng) * 0.1f;
+        }
+        for (int d = 0; d < 16; d++) {
+            int ch = (d * 4 + 1) % head_dim;
+            calib[t * head_dim + ch] = rand_normal(&rng) * 2.0f;
+        }
+    }
+
+    tq_outlier_config config;
+    tq_identify_outliers(&config, calib, n_calib, head_dim, 0.25f,
+                         TQ_TIER_TQ3, TQ_TIER_TQ2);
+
+    size_t outlier_sz, normal_sz;
+    tq_mixed_buffer_sizes(&config, &outlier_sz, &normal_sz);
+
+    /* Generate K cache and Q */
+    float * K = (float *)malloc(seq_len * head_dim * sizeof(float));
+    float * Q = (float *)malloc(head_dim * sizeof(float));
+
+    for (int i = 0; i < seq_len * head_dim; i++)
+        K[i] = rand_normal(&rng) * 0.1f;
+    for (int i = 0; i < head_dim; i++)
+        Q[i] = rand_normal(&rng) * 0.1f;
+
+    /* Inject outliers in K */
+    for (int t = 0; t < seq_len; t++) {
+        for (int d = 0; d < 16; d++) {
+            int ch = (d * 4 + 1) % head_dim;
+            K[t * head_dim + ch] *= 10.0f;
+        }
+    }
+
+    /* Compute original attention scores */
+    float * scores_orig = (float *)malloc(seq_len * sizeof(float));
+    for (int t = 0; t < seq_len; t++) {
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += Q[d] * K[t * head_dim + d];
+        scores_orig[t] = dot;
+    }
+
+    /* Pipeline: Hadamard → mixed quantize → dequantize → inverse Hadamard */
+    float * K_rot = (float *)malloc(seq_len * head_dim * sizeof(float));
+    float * Q_rot = (float *)malloc(head_dim * sizeof(float));
+    memcpy(K_rot, K, seq_len * head_dim * sizeof(float));
+    memcpy(Q_rot, Q, head_dim * sizeof(float));
+
+    for (int t = 0; t < seq_len; t++)
+        hadamard_transform(K_rot + t * head_dim, head_dim);
+    hadamard_transform(Q_rot, head_dim);
+
+    /* Mixed quantize/dequantize each token's K */
+    void * obuf = malloc(outlier_sz);
+    void * nbuf = malloc(normal_sz);
+    float * K_dequant = (float *)malloc(seq_len * head_dim * sizeof(float));
+
+    for (int t = 0; t < seq_len; t++) {
+        tq_mixed_quantize(K_rot + t * head_dim, &config, obuf, nbuf);
+        tq_mixed_dequantize(obuf, nbuf, &config, K_dequant + t * head_dim);
+    }
+
+    /* Compute attention in rotated space */
+    float * scores_mixed = (float *)malloc(seq_len * sizeof(float));
+    for (int t = 0; t < seq_len; t++) {
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += Q_rot[d] * K_dequant[t * head_dim + d];
+        scores_mixed[t] = dot;
+    }
+
+    float cosine_mixed = compute_cosine_sim(scores_orig, scores_mixed, seq_len);
+
+    /* Compare with uniform TQ2 */
+    int n_elems = seq_len * head_dim;
+    int nb_tq2 = n_elems / QK_TQ2;
+    block_tq2_0 * tq2_blocks = (block_tq2_0 *)malloc(nb_tq2 * sizeof(block_tq2_0));
+    float * K_dequant_u = (float *)malloc(n_elems * sizeof(float));
+
+    quantize_row_tq2_0_ref(K_rot, tq2_blocks, n_elems);
+    dequantize_row_tq2_0(tq2_blocks, K_dequant_u, n_elems);
+
+    float * scores_uniform = (float *)malloc(seq_len * sizeof(float));
+    for (int t = 0; t < seq_len; t++) {
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += Q_rot[d] * K_dequant_u[t * head_dim + d];
+        scores_uniform[t] = dot;
+    }
+
+    float cosine_uniform = compute_cosine_sim(scores_orig, scores_uniform, seq_len);
+
+    printf("  Attention cosine (mixed TQ3+TQ2):  %.6f\n", cosine_mixed);
+    printf("  Attention cosine (uniform TQ2):    %.6f\n", cosine_uniform);
+    printf("  Improvement: +%.4f\n", cosine_mixed - cosine_uniform);
+
+    CHECK(cosine_mixed > cosine_uniform,
+          "Mixed attention > uniform attention (%.4f > %.4f)",
+          cosine_mixed, cosine_uniform);
+    CHECK(cosine_mixed > 0.92f,
+          "Mixed attention cosine > 0.92 (got %.4f)", cosine_mixed);
+
+    free(calib); free(K); free(Q); free(K_rot); free(Q_rot);
+    free(obuf); free(nbuf); free(K_dequant);
+    free(scores_orig); free(scores_mixed);
+    free(tq2_blocks); free(K_dequant_u); free(scores_uniform);
+}
+
 /* ── Main ──────────────────────────────────────────────────────────── */
 
 int main(void) {
-    printf("TurboQuant TQ2_0 / TQ3_0 / TQ4_0 — Correctness Tests\n");
-    printf("=====================================================\n");
+    printf("TurboQuant TQ2_0 / TQ3_0 / TQ4_0 + Outlier — Correctness Tests\n");
+    printf("================================================================\n");
 
     /* TQ3/TQ4 tests (1-9) */
     test_codebook_symmetry();
@@ -1041,7 +1550,15 @@ int main(void) {
     test_requantize_chain();
     test_tq2_memory_layout();
 
-    printf("\n=====================================================\n");
+    /* Outlier treatment tests (18-23) */
+    test_outlier_detection();
+    test_mixed_precision_quality();
+    test_mixed_vs_uniform();
+    test_mixed_effective_bits();
+    test_outlier_hadamard_pipeline();
+    test_mixed_attention_preservation();
+
+    printf("\n================================================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;
 }

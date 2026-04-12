@@ -6,8 +6,8 @@ LDFLAGS = -lm
 
 all: test-tq
 
-test-tq: test-tq.c ggml-tq.c ggml-tq.h
-	$(CC) $(CFLAGS) -o $@ test-tq.c ggml-tq.c $(LDFLAGS)
+test-tq: test-tq.c ggml-tq.c ggml-tq.h ggml-tq-outlier.c ggml-tq-outlier.h
+	$(CC) $(CFLAGS) -o $@ test-tq.c ggml-tq.c ggml-tq-outlier.c $(LDFLAGS)
 
 test: test-tq
 	./test-tq
