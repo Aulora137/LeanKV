@@ -27,7 +27,7 @@ TQ4_0 works great on ARM (PPL delta ~+0.02 from F16 -- essentially lossless). No
 
 ## Phase 0: IQK Flash Attention Kernel for TQ3 (Speed Foundation)
 
-- [ ] Complete
+- [x] Complete
 
 **Why first:** Without this, TQ3 uses the generic `to_float()` fallback path, which is far slower than TQ4's IQK path. No quality improvement matters if TQ3 is too slow to use.
 
@@ -50,7 +50,7 @@ TQ4_0 works great on ARM (PPL delta ~+0.02 from F16 -- essentially lossless). No
 
 ## Phase 1: Smarter Quantization (Zero Decode Cost)
 
-- [ ] Complete
+- [x] Complete
 
 The biggest quality win. Only the ENCODE path changes -- block format and dequantization are untouched.
 
@@ -103,7 +103,7 @@ for each pass (2-3x):
 
 ---
 
-## Phase 2: Per-Layer Calibrated Codebooks (Zero Decode Cost)
+## Phase 2: Per-Layer Calibrated Codebooks (Zero Decode Cost) Not needed for now 4/10/26 
 
 - [ ] Complete
 
@@ -136,7 +136,7 @@ for each pass (2-3x):
 
 ---
 
-## Phase 3: Per-Block Bias Byte -- "TQ3_1" (Small Decode Cost)
+## Phase 3: Per-Block Bias Byte -- "TQ3_1" (Small Decode Cost) Not neede for now 4/10/26
 
 - [ ] Complete
 
@@ -180,5 +180,6 @@ This requires registering a new GGML type (`GGML_TYPE_TQ3_1`), which is more int
 1. **Phase 0** -- IQK kernel (AVX2 first, then NEON). Prerequisite for everything.
 2. **Phase 1** -- Optimal rounding (Python prototype -> C++). Biggest quality gain, zero decode cost.
 3. **Benchmark** TQ3 PPL on Qwen3.5-9B (AVX2). If delta < 0.3, port to ARM and stop.
+Phase 2 and 3 below have been skipped.  Phase 1 result is deemed adequate
 4. **Phase 2** -- Per-layer codebooks. Only if Phase 1 isn't enough.
 5. **Phase 3** -- TQ3_1 with bias byte. Last resort (unlikely needed for < 0.3 target).

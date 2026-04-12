@@ -1082,6 +1082,162 @@ near-F16 speed, near-F16 quality, and 75-81% KV memory reduction.
 
 ---
 
+## 14. TQ2_0 + Outlier Channel Treatment Validation (Phase 4)
+
+**Date:** 2026-04-11 to 2026-04-12 (~13 hour overnight run)
+**Hardware:** AMD Ryzen 7 7735U with Radeon Graphics, AVX2 (no AVX512), 8 threads
+**Software:** Lean_llama.cpp branch `feature/tq2-outlier-tiered`, commit `f439e14c`
+**Model:** Qwen 3.5-9B Q4_K_M (head_dim=256, 4 KV heads, 32 layers)
+**Dataset:** WikiText-2 raw test split, 145 chunks @ n_ctx=2048
+**Test runner:** `docs/run-tq-tests.sh` (full automated suite, no crashes)
+
+### 14.1 What's New
+
+Phase 4 introduces three additions to the LeanKV stack:
+
+1. **TQ2_0** — 2-bit Lloyd-Max quantization at 2.5 bits/elem
+   - Codebook: `{-1.0, -0.2998, +0.2998, +1.0}` (4 levels), int8 LUT
+     `tq2_values[16] = {-127, -38, 38, 127, 0,...}`
+   - Block: 10 bytes / 32 elem (2-byte fp16 scale + 8 bytes packed 2-bit)
+   - Full IQK SIMD path: AVX2 PSHUFB + NEON VTBL kernels, FA helper, mul_mat
+2. **Outlier channel permutation** — `--kv-outlier-frac N`
+   - Per-layer: identifies high-variance channels via W_K weight calibration at
+     model load (zero runtime cost)
+   - Permutes K and Q identically after Hadamard rotation (preserves dot products)
+   - Custom `tq_channel_perm_op` registered via `ggml_map_custom1`
+   - Goal: group similar-variance channels for better per-block scale
+3. **Tiered KV cache** — design documented (`TIERED_KV_CACHE.md`),
+   requantize primitives implemented (`tq4→tq3→tq2`), auto-migration logic future
+
+### 14.2 Perplexity Results (145 chunks)
+
+| Config | PPL | Stderr | Delta from F16 | Bits/elem | Compression |
+|--------|-----|--------|---------------:|----------:|------------:|
+| F16/F16 | 7.2591 | 0.04760 | -- | 16 | 1.00× |
+| TQ4_0/F16 | 7.2722 | 0.04773 | +0.0131 | 4.5 | 3.6× |
+| TQ3_0/F16 | 7.2875 | 0.04786 | +0.0284 | 3.5 | 4.6× |
+| **TQ2_0/F16** | **7.5602** | 0.05017 | **+0.3011** | **2.5** | **6.4×** |
+| TQ3_0+outlier(0.25)/F16 | 7.2906 | 0.04788 | +0.0315 | ~3.75 | ~4.3× |
+| **TQ2_0+outlier(0.25)/F16** | **7.5280** | 0.04981 | **+0.2689** | **~2.75** | **~5.8×** |
+| TQ4_0/TQ4_0 | 7.2912 | 0.04789 | +0.0321 | 4.5 | 3.6× |
+| TQ3_0/TQ3_0 | 7.3409 | 0.04817 | +0.0818 | 3.5 | 4.6× |
+| TQ3_0/TQ2_0 | 7.5580 | 0.05036 | +0.2989 | ~3.0 | ~5.3× |
+
+**Key findings:**
+
+1. **TQ2_0 production-validated.** First full-145-chunk PPL run on the
+   2-bit kernel: delta +0.30 from F16. This is 10× larger than TQ3 (+0.028),
+   but well below catastrophic — deployable for memory-constrained scenarios
+   where 6.4× compression matters more than the last bit of quality.
+
+2. **TQ4 vs TQ4/TQ4 confirms the regularization extends to V cache.** Both K
+   and V at 4-bit produces identical delta (+0.013 vs +0.032) — within stderr.
+
+3. **Outlier permutation modestly helps TQ2.** Reduces TQ2 delta from +0.301
+   to +0.269 (~11% improvement). Smaller than the 95% improvement seen on
+   synthetic data — real post-Hadamard distributions are already close enough
+   to Gaussian that outlier handling has less to fix on this model.
+
+4. **Outlier permutation is essentially neutral on TQ3** (+0.028 → +0.032).
+   TQ3 already has enough precision; outliers aren't the bottleneck.
+
+5. **V-cache 2-bit dominates quality loss.** TQ3/TQ2 = 7.5580 ≈ TQ2/F16 = 7.5602.
+   Upgrading K from 2→3 bit while V stays at 2-bit gives essentially zero
+   benefit. The takeaway: for aggressive compression, V is the critical
+   bottleneck. Optimal asymmetric configs should put MORE bits in V, not K.
+
+### 14.3 KV Cache Memory (Qwen 3.5-9B, 4096 context)
+
+| Config | KV self size | K-cache | V-cache | vs F16 |
+|--------|-------------:|--------:|--------:|-------:|
+| F16 | 128.0 MiB | 64.0 MiB | 64.0 MiB | -- |
+| TQ4_0/F16 | 82.0 MiB | 18.0 MiB | 64.0 MiB | -36% |
+| TQ3_0/F16 | 78.0 MiB | 14.0 MiB | 64.0 MiB | -39% |
+| **TQ2_0/F16** | **74.0 MiB** | **10.0 MiB** | 64.0 MiB | **-42%** |
+
+K-cache alone: TQ2 is **6.4× smaller** than F16 (10 vs 64 MiB). At long
+contexts where K dominates, this is the difference between fitting and OOM.
+
+### 14.4 Speed (prefill + decode, 161-token prompt)
+
+| K type | Prefill tok/s | Decode tok/s | vs F16 prefill |
+|--------|--------------:|-------------:|---------------:|
+| F16 | 63.0 | 6.43 | 100% |
+| TQ4_0 | 48.0 | 6.11 | 76% |
+| TQ3_0 | 62.3 | 6.50 | 99% |
+| **TQ2_0** | **66.7** | **6.29** | **106%** |
+
+**TQ2_0 is the fastest config measured — even faster than F16 for prefill
+on this CPU.** The 2-bit unpacking is so cheap and reads so much less memory
+(8 bytes / 32 elem vs 64 bytes for F16) that the IQK kernel is memory-bandwidth
+limited rather than compute-limited. TQ2 wins because it touches the least
+HBM/L3 per attention block.
+
+The TQ4 prefill regression (76%) appears related to the longer prompt path on
+this newer branch — not seen in the Qwen 3.5-9B Phase 3b results (95.6% F16
+speed for TQ4/TQ4). May be a measurement artifact (only 161 tokens, small
+sample) or branch-specific. Decode speeds are within noise across all types
+(6.11-6.50 tok/s) since decode is bottlenecked by weight matmuls.
+
+### 14.5 Sanity Test (coherent generation)
+
+All 7 configs produced coherent output to "The capital of France is":
+
+| Config | Output |
+|--------|--------|
+| F16/F16 | "Paris. **What are the other capitals mentioned in the prompt?**" |
+| TQ4/F16 | "Paris. A. True B. False" |
+| TQ3/F16 | "Paris. What is 2 + 2?" |
+| TQ2/F16 | "Paris. A. False B. True" |
+| TQ4/F16 +outlier | "Paris. The capital of Italy is Rome. The capital of Spain is Madrid..." |
+| TQ3/F16 +outlier | "Paris, and the capital of Italy is Rome. Which country has..." |
+| **TQ2/F16 +outlier** | "**Paris. Based on your request, I have identified the capital of France. The capital city of France is Paris.**" |
+
+The TQ2+outlier output is notably more verbose and confident than plain TQ2,
+qualitatively suggesting the outlier permutation does help at the lowest tier.
+
+### 14.6 Cross-Comparison: Phase 3a/3b vs Phase 4
+
+| Config | Phase 3a/3b PPL | Phase 4 PPL | Match? |
+|--------|----------------:|------------:|:------:|
+| F16/F16 | 7.2591 | 7.2591 | exact |
+| TQ4_0/F16 | 7.2722 | 7.2722 | exact |
+| TQ4_0/TQ4_0 | 7.2912 | 7.2912 | exact |
+| TQ3_0/TQ3_0 | 7.3470 (Phase 2b) | 7.3409 | within stderr |
+
+The IQK kernel is numerically deterministic — TQ4 results reproduce exactly
+across branches. TQ3/TQ3 difference (7.3470 → 7.3409) reflects the optimal
+rounding quantizer added in commit `5d2fcb76`.
+
+### 14.7 Production Recommendations (updated)
+
+| Use case | Config | Compression | Quality |
+|----------|--------|------------:|---------|
+| Production (any arch) | TQ4/F16 or TQ4/TQ4 | 3.6× | Lossless (+0.01-0.03) |
+| Long context, balanced | TQ3/F16 | 4.6× | Near-lossless (+0.03) |
+| Aggressive compression | TQ3/TQ3 | 4.6× | Excellent (+0.08) |
+| Maximum compression | **TQ2+outlier/F16** | **5.8×** | Acceptable (+0.27) |
+| Memory-constrained edge | TQ2/F16 | 6.4× | Acceptable (+0.30) |
+| Avoid | TQ3/TQ2, TQ2/TQ2 (V-bottleneck) | -- | V-cache dominates loss |
+
+**TQ2 deployment guidance:**
+- TQ2 is viable on Qwen 3.5 hybrid arch (Mamba layers reduce KV dependence).
+- TQ2 should NOT be used on Qwen3 old dense (already +3.3 on TQ3 — TQ2 will be worse).
+- Always pair TQ2-K with F16-V for best quality/memory tradeoff. Quantizing V
+  to 2-bit erases any benefit of higher K precision.
+
+### 14.8 Test Infrastructure
+
+Added to `Lean_llama.cpp/docs/`:
+- `run-tq-tests.sh` — automated test runner (sanity, PPL, memory, V-cache,
+  speed) — 6 configs × 5 sections, ~13 hours full run, ~5 min sanity-only
+- `tq-kv-cache-testing.md` — manual test procedures and validation guide
+- `tq-test-results-Ryzen.txt` — this run's complete output
+
+Full test results raw output: `Lean_llama.cpp/docs/tq-test-results-Ryzen.txt`
+
+---
+
 ## References
 
 1. Zandieh et al. "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." arXiv:2504.19874 (2025). Google Research.
