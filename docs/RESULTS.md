@@ -1160,24 +1160,80 @@ contexts where K dominates, this is the difference between fitting and OOM.
 
 ### 14.4 Speed (prefill + decode, 161-token prompt)
 
+**Initial measurement (commit `f439e14c`):**
+
 | K type | Prefill tok/s | Decode tok/s | vs F16 prefill |
 |--------|--------------:|-------------:|---------------:|
 | F16 | 63.0 | 6.43 | 100% |
-| TQ4_0 | 48.0 | 6.11 | 76% |
+| TQ4_0 | 48.0 | 6.11 | **76%** ⚠️ |
 | TQ3_0 | 62.3 | 6.50 | 99% |
-| **TQ2_0** | **66.7** | **6.29** | **106%** |
+| TQ2_0 | 66.7 | 6.29 | 106% |
 
-**TQ2_0 is the fastest config measured — even faster than F16 for prefill
-on this CPU.** The 2-bit unpacking is so cheap and reads so much less memory
-(8 bytes / 32 elem vs 64 bytes for F16) that the IQK kernel is memory-bandwidth
-limited rather than compute-limited. TQ2 wins because it touches the least
-HBM/L3 per attention block.
+The TQ4_0 24% slowdown was anomalous — TQ3 and TQ2 were both at parity with
+F16, and TQ4 should have been *between* them, not slower than both. Root
+cause investigation in commit `c0db018f`:
 
-The TQ4 prefill regression (76%) appears related to the longer prompt path on
-this newer branch — not seen in the Qwen 3.5-9B Phase 3b results (95.6% F16
-speed for TQ4/TQ4). May be a measurement artifact (only 161 tokens, small
-sample) or branch-specific. Decode speeds are within noise across all types
-(6.11-6.50 tok/s) since decode is bottlenecked by weight matmuls.
+**Root cause:** `find_nearest_tq4()` in the encode path used a 15-iteration
+linear scan of `TQ4_BOUNDARIES[]`. During prefill, every K vector is encoded
+once before being stored in the cache, calling `find_nearest_tq4` 32 times
+per block. For a 161-token prompt with head_dim=256 over 32 layers, this is
+~600K extra comparisons that don't appear in TQ3 (7-iter scan) or TQ2
+(3-iter scan).
+
+**Fix:** Replaced linear scan with a 4-comparison binary search exploiting
+the symmetry of `TQ4_BOUNDARIES` around zero. 3.75× fewer comparisons per
+element. (`ggml/src/ggml-tq.c:171-205`)
+
+**After fix (median of 3 runs each, commit `c0db018f`):**
+
+| K type | Prefill tok/s | Decode tok/s | vs F16 prefill |
+|--------|--------------:|-------------:|---------------:|
+| F16 | 65.6 | 6.40 | 100% |
+| **TQ4_0** | **66.3** | **6.21** | **101%** ✓ |
+| TQ3_0 | 62.2 | 6.37 | 95% |
+| TQ2_0 | 66.0 | 6.34 | 101% |
+
+**Validation across prompt lengths:**
+
+| Config | 161-token prompt | 641-token prompt | 4096-context Q4_0 baseline |
+|--------|-----------------:|-----------------:|---------------------------:|
+| F16 | 65.6 tok/s | 66.4 tok/s | 63.8 tok/s |
+| TQ4_0 | 66.3 tok/s | 66.9 tok/s | 64.6 tok/s |
+| Q4_0 (standard) | -- | -- | 67.8 tok/s |
+
+TQ4_0 is now at parity with F16 across all prompt lengths and within 5% of
+standard Q4_0 (which has no Hadamard rotation). The "TQ2 is the fastest"
+finding still holds at the noise level — all four KV types (F16, TQ4, TQ3,
+TQ2) are bunched between 62-66 tok/s on this CPU because the dominant cost
+is weight matmul, not KV cache operations.
+
+**Decode speed**: All within noise (6.21-6.40 tok/s) — decode was never
+the issue. The bottleneck is weight matmul regardless of KV type at this
+model size.
+
+### 14.4.1 Lessons Learned
+
+1. **Encode path matters during prefill.** The IQK kernels optimize the
+   *decode* (dequantize) path beautifully, but every K vector gets encoded
+   once before being cached. For long prompts that's tens of thousands of
+   blocks, and the encode path's per-element cost shows up in prefill speed.
+
+2. **Lookup table size scales the encode cost.** TQ2 (4 levels, 3 boundaries),
+   TQ3 (8 levels, 7 boundaries), TQ4 (16 levels, 15 boundaries) — linear
+   scan over the boundary table is O(2^bits). At 4 bits the linear scan
+   becomes a measurable hot loop.
+
+3. **Binary search is the right tool here.** All the boundary tables are
+   sorted and symmetric around zero, so log2(N) comparisons replace linear
+   scan with no quality impact (same nearest-level result). TQ3 could
+   theoretically benefit too (3 comparisons vs 7), but at 7 iterations the
+   compiler unrolls effectively and the gain is in noise.
+
+4. **Diagnostic-first debugging.** The `docs/tq4-speed-diag.sh` script tests
+   the same config across multiple prompt lengths, isolates decode speed,
+   and compares against standard Q4_0 — all in one run. This pattern
+   (multiple trials × multiple stress conditions) is essential for noisy
+   CPU benchmarks where single measurements are unreliable.
 
 ### 14.5 Sanity Test (coherent generation)
 
