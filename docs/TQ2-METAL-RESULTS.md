@@ -103,7 +103,108 @@ shows significant degradation. Good reference point — matched Q/KV dimensions.
 
 ---
 
-## 3. TQ2_1 Mixed-Precision Validation
+## 3. Decode Speed (Metal GPU, M2)
+
+Measured with `llama-cli`, 128-token generation, 2048 context, `-ngl 99`.
+
+### 3.1 Initial Validation (4 TQ types, short generation)
+
+| Model | F16 | TQ4_0 | TQ3_0 | TQ2_0 |
+|-------|----:|------:|------:|------:|
+| Llama-3-8B | 11.7 | 6.4 | 6.0 | 6.1 |
+| Gemma 3-4B | 18.1 | 9.2 | 7.8 | 8.2 |
+| Mistral 7B | 11.7 | 6.2 | 6.0 | 6.3 |
+| Qwen3-8B | 8.9 | 5.9 | 5.6 | 5.8 |
+
+### 3.2 Full Comparison Including TQ2_1 (128-token generation)
+
+| Model | F16 | TQ4_0 | TQ3_0 | TQ2_1 | TQ2_0 |
+|-------|----:|------:|------:|------:|------:|
+| Llama-3-8B | 9.90 | 5.96 | 5.94 | 5.91 | 5.93 |
+| Qwen3-8B | 9.12 | 5.66 | 5.65 | 5.57 | 5.69 |
+| Gemma-3-4B | 13.12 | 8.47 | 8.12 | 8.11 | 8.22 |
+| Mistral-7B | 11.23 | 6.22 | 6.29 | 5.99 | 6.12 |
+
+**Observations:**
+- All TQ types run at roughly **50-65% of F16 decode speed** on Metal. This is
+  expected — TQ dequantization adds overhead to every KV cache read during decode.
+- TQ2_1, TQ2_0, TQ3_0, and TQ4_0 are within noise of each other — the decode
+  bottleneck is the dequant dispatch, not the bit-width.
+- Gemma-3-4B is fastest because it has only 4 KV heads (vs 8 on the others),
+  so there's less KV cache to process per token.
+- At long contexts where KV cache reads dominate, the compression benefit
+  (fitting more in unified memory / avoiding spill) should offset the dequant cost.
+
+---
+
+## 4. KV Cache Memory
+
+### 4.1 Per-Type Compression (8 KV heads × 128 head_dim, 2048 context)
+
+| Type | Bits/elem | KV Size | Compression vs F16 |
+|------|:---------:|--------:|:------------------:|
+| F16 | 16.0 | 256 MiB | 1.0x |
+| TQ4_0 | 4.5 | 72 MiB | 3.6x |
+| TQ3_0 | 3.5 | 56 MiB | 4.6x |
+| TQ2_1 | 2.75 | 44 MiB | 5.8x |
+| TQ2_0 | 2.5 | 40 MiB | 6.4x |
+
+### 4.2 Per-Model KV Cache (from `llama_init_from_model`, 2048 context)
+
+| Model | n_layer | n_head_kv | head_dim | F16 K+V | TQ4 K+V | TQ3 K+V | TQ2_0 K+V |
+|-------|:-------:|:---------:|:--------:|--------:|--------:|--------:|----------:|
+| Llama-3-8B | 32 | 8 | 128 | 64 MiB | 18 MiB | 14 MiB | 10 MiB |
+| Qwen3-8B | 36 | 8 | 128 | 72 MiB | 20 MiB | 16 MiB | 12 MiB |
+| Gemma-3-4B | 26 | 4 | 256 | 52 MiB | 15 MiB | 11 MiB | 10 MiB |
+| Mistral-7B | 32 | 8 | 128 | 64 MiB | 18 MiB | 14 MiB | 10 MiB |
+
+**Key takeaway:** TQ2_1 delivers **5.8x compression** with quality comparable to
+TQ3_0 on ratio=1.0 models. It's the sweet spot — only 10% more memory than TQ2_0
+but avoids the quality collapse that TQ2_0 shows on harder tasks (particularly
+Qwen3-8B). Speed is within noise of TQ2_0/TQ3_0 across all models.
+
+---
+
+## 5. Output Quality — Generation Coherence
+
+Prompt: *"Explain why the sky is blue in one sentence."*
+
+| Model | F16 | TQ4_0 (4.5b) | TQ3_0 (3.5b) | TQ2_1 (2.75b) | TQ2_0 (2.5b) |
+|-------|:---:|:------------:|:------------:|:-------------:|:------------:|
+| Llama-3-8B | Correct | Correct | Correct | Correct | Correct |
+| Qwen3-8B | Correct | Correct | Correct | Correct | Degraded (echoed instructions) |
+| Gemma-3-4B | Correct | Correct | Correct | Correct | Correct |
+| Mistral-7B | Correct | Correct | Correct | Correct | Correct |
+
+**Note:** Qwen3-8B TQ2_0 produced degraded output (echoed the instruction back
+instead of answering), while TQ2_1 was correct — confirming the mixed-precision
+approach rescues quality at only +0.25 bpe cost.
+
+---
+
+## 6. Qwen3.5-9B: Metal FA Incompatibility
+
+Qwen3.5-9B was **not tested on Metal GPU** because its architecture triggers a
+pre-existing Metal Flash Attention assertion failure:
+
+```
+GGML_ASSERT(ne10 == ne02) failed at ggml-metal.m:3425
+```
+
+**Root cause:** Qwen3.5-9B uses `head_dim=256` with a hybrid Mamba+attention
+architecture. The Metal FA kernel's dimension compatibility check
+(`ne10 == ne02`) is violated by this architecture. This is a pre-existing Metal
+limitation, not TQ-related — **even F16 baseline fails** on Metal.
+
+**Workaround:** Run with `ngl=0` (CPU-only, no GPU offload). All CPU benchmarks
+for Qwen3.5-9B (Sections 11-14 in RESULTS.md) were run this way.
+
+**Status:** This is an upstream Metal FA issue. Qwen3.5-9B works correctly on
+CPU (AVX2 and ARM NEON IQK paths) with all TQ types.
+
+---
+
+## 7. TQ2_1 Mixed-Precision Validation
 
 TQ2_1 consistently outperforms TQ2_0 across all models, confirming the value of
 giving 32 channels TQ3 precision (3.5 bpe) while the remaining 96 use TQ2 (2.5 bpe).
@@ -120,7 +221,7 @@ equal variance, so ANY 32 channels receiving TQ3 treatment benefits quality unif
 
 ---
 
-## 4. Root Cause: Qwen3-4B Quantization Sensitivity
+## 8. Root Cause: Qwen3-4B Quantization Sensitivity
 
 ### The Anomaly
 
@@ -209,7 +310,7 @@ TQ4_0 remains available (borderline acceptable at +6.6% PPL on Qwen3-4B).
 
 ---
 
-## 5. Compression Summary
+## 9. Compression Summary
 
 Memory per KV token (head_dim=128, per head):
 
@@ -229,7 +330,7 @@ For a model with 8 KV heads, 36 layers, 32k context:
 
 ---
 
-## 6. Models Tested
+## 10. Models Tested
 
 | Model | File | Size | Source |
 |-------|------|------|--------|
@@ -243,7 +344,7 @@ All models quantized to Q4_K_M for weight storage. KV cache type varied per test
 
 ---
 
-## 7. Open Questions
+## 11. Open Questions
 
 1. ~~**Can we detect Q/KV mismatch at model load and auto-select max TQ level?**~~
    **Done.** Implemented in `src/llama.cpp:llama_init_from_model()`. Auto-downgrades
