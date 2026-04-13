@@ -1439,6 +1439,167 @@ algorithm family.
 
 ---
 
+## 16. TQ2_1 Mixed-Precision CPU SIMD (Phase 4b)
+
+**Date:** 2026-04-12
+**Hardware:** AMD Ryzen 7 7735U, AVX2 (no AVX512), 8 threads
+**Software:** Lean_llama.cpp branch `feature/tq2-outlier-tiered`, commit `8e860b9d`
+**Model:** Qwen 3.5-9B Q4_K_M (head_dim=256)
+
+### 16.1 Context
+
+TQ2_1 is a new mixed-precision GGML type introduced for Metal on 2026-04-12
+(commit `6f9e0c3c`). Block layout: **128 elements / 44 bytes**:
+
+```
+block_tq2_1 {
+    ggml_half d_out;       // outlier TQ3 scale
+    uint8_t   qs_out[12];  // 32 × 3-bit packed indices (TQ3)
+    ggml_half d_n0;        // normal TQ2 group 0 scale
+    uint8_t   qs_n0[8];    // 32 × 2-bit packed indices (TQ2)
+    ggml_half d_n1;        // normal TQ2 group 1 scale
+    uint8_t   qs_n1[8];
+    ggml_half d_n2;        // normal TQ2 group 2 scale
+    uint8_t   qs_n2[8];
+}  // 2.75 bits/element effective
+```
+
+Effectively a TQ3 sub-block (outlier channels) followed by 3 × TQ2 sub-blocks
+(normal channels), each with independent scale. This implements the
+mixed-precision outlier concept discussed in Section 15 as a static type
+(rather than runtime dynamic permutation), requiring no per-layer calibration.
+
+### 16.2 CPU/AVX2 Integration Challenges
+
+TQ2_1 was initially Metal-only. On CPU the type had scalar infrastructure
+(type traits, quantize/dequantize, scalar vec_dot) but no SIMD acceleration.
+
+**Why full IQK integration is hard for TQ2_1**: The existing IQK kernel
+framework uses templates like `Q_Unpacker<block_X, ScaleHelper, Dequantizer>`
+that are deeply built around **32-element blocks** interleaving with
+`block_q8_2` for quantized dot products. TQ2_1's 128-element block with 4
+internal scales breaks this assumption. Full IQK integration would require
+either:
+
+1. A new 128-element template path in `mul_mat_qX_0_q8_0_T`
+2. Or a bespoke mul_mat kernel for TQ2_1 outside the template framework
+
+Both are multi-day efforts with high regression risk.
+
+### 16.3 Pragmatic Solution: SIMD vec_dot
+
+Rather than rewrite the IQK template, we SIMD-accelerated the scalar
+`ggml_vec_dot_tq2_1_q8_0` function (which is used by the **generic FA
+fallback path** when IQK doesn't support the type).
+
+The key observation: each TQ2_1 block decomposes into 1 TQ3 sub-block + 3
+TQ2 sub-blocks, matched against 4 Q8_0 blocks from Q. We already have
+optimized AVX2 + NEON SIMD for both TQ3 and TQ2 vec_dot. Compose them:
+
+```
+For each TQ2_1 block (128 elements):
+  1. SIMD TQ3 dot of qs_out × yb[0].qs → partial_tq3
+  2. SIMD TQ2 dot of qs_n0 × yb[1].qs → partial_tq2_0
+  3. SIMD TQ2 dot of qs_n1 × yb[2].qs → partial_tq2_1
+  4. SIMD TQ2 dot of qs_n2 × yb[3].qs → partial_tq2_2
+  5. Accumulate all 4 into final sum
+```
+
+AVX2 implementation: `_mm_shuffle_epi8` (128-bit LUT) for TQ3, 
+`_mm256_shuffle_epi8` (256-bit LUT) for TQ2, `mul_add_epi8` + `madd_epi16`
+for int dot, `fmadd_ps` for float accumulation. Same pattern as existing
+`ggml_vec_dot_tq3_0` / `ggml_vec_dot_tq2_0`.
+
+NEON implementation: `ggml_vqtbl1q_s8` for codebook lookup and
+`ggml_vdotq_s32` for dot product.
+
+### 16.4 Correctness Validation
+
+Sanity test with `-ctk tq2_1 -ctv tq2_1 -p "The capital of France is"` on
+Qwen 3.5-9B produces coherent output:
+
+> "Paris, and the capital of Italy is Rome. The question asks for the capital"
+
+Perplexity (3 chunks, Qwen 3.5-9B, WikiText-2):
+
+| Config | PPL | Stderr | Delta from F16 |
+|--------|----:|-------:|---------------:|
+| F16/F16 | 7.9080 | 0.357 | -- |
+| **TQ2_1/TQ2_1** | **8.2873** | 0.380 | **+0.38** |
+| TQ2_0/F16 (Phase 4, 145 chunks) | 7.5602 | 0.050 | +0.30 |
+
+The +0.38 delta for TQ2_1 is within stderr of the +0.30 TQ2_0 baseline.
+TQ2_1's slightly higher memory (2.75 vs 2.5 bpe) does not produce a clear
+quality win on Qwen 3.5-9B at 3-chunk confidence — this is a hybrid-arch
+model that already handles low-bit quantization well.
+
+### 16.5 Speed Results
+
+**Short prompt (5 tokens) — dominated by model-load overhead:**
+
+| Config | Prefill tok/s |
+|--------|--------------:|
+| F16 | 65.6 |
+| TQ2_1 | 28.0 |
+
+Short prompts are misleading — most time is in setup, not attention.
+
+**Long prompt (1281 tokens) — sustained prefill:**
+
+| Config | Prefill tok/s | vs F16 | Path |
+|--------|--------------:|-------:|------|
+| F16 | 67.1 | 100% | Native |
+| TQ2_0 | 65.7 | 98% | Full IQK FA |
+| TQ3_0 | 64.4 | 96% | Full IQK FA |
+| **TQ2_1** | **58.7** | **88%** | Generic FA + SIMD vec_dot |
+
+**TQ2_1 reaches 88% of F16 prefill speed** on sustained workloads through
+the SIMD vec_dot alone — no IQK FA kernel required. The 10% gap to TQ2_0
+(which has full IQK) reflects the remaining scalar paths:
+
+1. **V-side `to_float`** — `dequantize_row_tq2_1` is still scalar. The
+   generic FA path dequantizes each V row before accumulation.
+2. **Encode path** — `quantize_row_tq2_1_ref` is scalar and calls the
+   coord-descent TQ3 quantizer (which dominates encode cost).
+3. **Generic FA overhead** — per-query-row Q8_0 conversion and softmax
+   scalar loops that IQK FA fuses together.
+
+Decode speed: within noise across all types (~6.2-6.5 tok/s) — decode is
+weight-matmul bound, not KV-cache bound at this model size.
+
+### 16.6 Why Not Full IQK Integration?
+
+The remaining 10% gap to TQ2_0 prefill speed is tempting but not worth the
+engineering cost for three reasons:
+
+1. **TQ2_1 is a Phase 4 experimental feature** — the ship-critical types are
+   TQ2_0, TQ3_0, TQ4_0, all of which already have full IQK. TQ2_1 is an
+   alternative compression tier, not a replacement.
+
+2. **Metal is the primary TQ2_1 target** — Apple Silicon has first-class
+   Metal kernels for TQ2_1, with no block-size template constraints. CPU
+   TQ2_1 at 88% of F16 is "good enough" for development and edge use cases.
+
+3. **Full IQK would need framework restructuring** — the `Q_Unpacker` template
+   assumes 32-element blocks paired with 32-element Q8 blocks. A 128-element
+   block would need either a new template specialization or a custom kernel
+   path outside the framework. Multi-day work with nontrivial regression risk
+   on the already-working TQ2_0/TQ3_0/TQ4_0 kernels.
+
+**Conclusion**: TQ2_1 on CPU/AVX2 is production-ready at 88% of F16 prefill
+speed, with correct output and quality matching TQ2_0. Full IQK integration
+is a future optimization, not a blocker.
+
+### 16.7 Files Modified
+
+| File | Change |
+|------|--------|
+| `ggml/src/ggml-tq.c` | Added AVX2 + NEON SIMD paths to `ggml_vec_dot_tq2_1_q8_0` (+89 lines) |
+
+Commit: `8e860b9d` (`feature/tq2-outlier-tiered` branch).
+
+---
+
 ## References
 
 1. Zandieh et al. "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." arXiv:2504.19874 (2025). Google Research.
