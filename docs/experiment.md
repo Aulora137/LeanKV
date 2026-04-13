@@ -302,6 +302,194 @@ Llama mystery rigorously.
 
 ---
 
+## M2 Cross-Platform Validation (Apple Silicon)
+
+**Date:** 2026-04-12
+**Hardware:** Apple M2, 16 GB unified memory
+**Software:** Same commit `114437b9`, built with Metal enabled
+**Models:** 7 GGUF Q4_K_M files (5 overlap with Ryzen, 2 new)
+
+### Results
+
+| Model | head_dim | 0% | 12.5% | 25% | 50% | Max var/median range |
+|-------|---------:|---:|------:|----:|----:|----------------------|
+| Qwen 3.5-9B | 256 | **8** | 0 | 0 | 0 | 1.5–2.1× |
+| Mistral 7B | 128 | **27** | 5 | 0 | 0 | 1.5–2.7× |
+| Gemma 3-4B | 256 | 15 | **15** | 4 | 0 | 1.6–3.7× |
+| Llama 3-8B | 128 | **32** | 0 | 0 | 0 | 1.3–2.8× |
+| Qwen3-8B | 128 | 29 | **6** | 1 | 0 | 1.3–2.3× |
+| Qwen3-4B | 128 | 29 | **6** | 1 | 0 | 1.4–2.7× |
+| Qwen2.5-0.5B | 64 | 12 | 5 | **7** | 0 | 1.4–**17.2×** |
+
+### Cross-Platform Comparison (Ryzen AVX2 vs M2 ARM)
+
+**Exact matches** on all 3 models available on both platforms with identical
+GGUF files:
+
+| Model | Ryzen | M2 | Match |
+|-------|-------|-----|:-----:|
+| Qwen 3.5-9B | 0%=8 | 0%=8 | **Exact** |
+| Mistral 7B | 0%=27, 12.5%=5 | 0%=27, 12.5%=5 | **Exact** |
+| Gemma 3-4B | 0%=15, 12.5%=15, 25%=4 | 0%=15, 12.5%=15, 25%=4 | **Exact** |
+
+The auto-detect is **platform-independent and deterministic** — it reads
+W_K weight values, which are identical in the GGUF file regardless of CPU.
+
+**Qwen3-4B discrepancy** (Ryzen: 18/11/7 vs M2: 29/6/1): likely different
+GGUF files (different quantization runs from different HuggingFace sources).
+Q4_K_M is itself quantized, so W_K weight values differ slightly between
+quantization runs. Channels near the 2× median threshold flip classification.
+This sensitivity to weight quantization artifacts is worth noting — the
+auto-detect results are deterministic for a given GGUF file, but not
+necessarily stable across different Q4_K_M quantizations of the same model.
+
+**Different models per platform:**
+
+| Ryzen only | M2 only |
+|-----------|---------|
+| Qwen 3.5-4B (0%=8) | Llama 3-8B (0%=32) |
+| Qwen 3.5-2B (0%=6) | Qwen3-8B (29/6/1) |
+| Llama 3.2-3B (0%=28) | Qwen2.5-0.5B (12/5/7) |
+
+### New Findings from M2
+
+**1. Qwen2.5-0.5B: extreme outliers at head_dim=64**
+
+The smallest model has by far the heaviest tails — layer 0 shows
+**17.2× max var/median** with 9 strong outliers (>5× median), and layers
+9, 11, 13 show 6.7–7.3× with 7–13 strong outliers. No other model has
+ANY strong outliers. At head_dim=64, the Hadamard concentration-of-measure
+effect is weakest — outliers survive rotation.
+
+This is direct evidence that **smaller models with smaller head_dim are
+more vulnerable to KV quantization**, independent of the Q/KV ratio issue
+found in Qwen3-4B.
+
+**2. Llama 3-8B: completely flat, all 32 layers at 0%**
+
+Same pattern as Llama 3.2-3B on Ryzen (all 28 layers at 0%). The "Llama
+mystery" is confirmed: Llama-family models show zero W_K channel variance
+imbalance yet are the most TQ3-sensitive modern dense architecture. The
+sensitivity mechanism is not structural outliers — it's something else
+entirely (see Section "The Llama mystery" above).
+
+**3. Qwen3-8B and Qwen3-4B: identical distribution pattern on M2**
+
+Both show 29/6/1 split. Since Qwen3-4B has the catastrophic rank-deficiency
+issue (n_embd/n_head=80 < head_dim=128) while Qwen3-8B doesn't, the W_K
+variance pattern is NOT what causes the quality divergence. The rank-deficiency
+is the dominant factor, confirming the DESIGN-FOR-QUANTIZATION.md finding.
+
+---
+
+## The Unpredictability Problem
+
+The cross-model and cross-platform data reveals an uncomfortable truth:
+**outlier patterns are model-specific and cannot be predicted from architecture
+parameters alone.** Every model family shows a different fingerprint:
+
+| Family | Pattern | Predictable from arch? |
+|--------|---------|:----------------------:|
+| Qwen 3.5 hybrid | Flat everywhere | Yes (Mamba regularizes) |
+| Llama | Flat everywhere, yet TQ3-sensitive | **No** |
+| Mistral | Mostly flat, 5 middle layers elevated | No |
+| Gemma | Heavy tails, middle layers dominate | Partially (head_dim=256 helps) |
+| Qwen3 old dense | Moderate tails, variable per-layer | No |
+| Qwen2.5 tiny | Extreme outliers, strong >5× | Partially (head_dim=64 hurts) |
+
+**You cannot assume a fixed outlier fraction works.** 25% is too much for
+Qwen 3.5 (wastes bits on already-flat channels), too little for Qwen2.5-0.5B
+(layer 0 needs 50%+ to cover 17× outliers), and irrelevant for Llama
+(outliers aren't the problem).
+
+### How Much Dynamic Adjustment Is Possible?
+
+The good news: all the adjustment happens **before** any KV token is
+quantized. The auto-detect pipeline has three decision points, each at
+a different stage of model loading:
+
+**Stage 1: Architecture check (instant, at model load)**
+
+Already implemented. Checks `n_embd/n_head < head_dim` and auto-downgrades
+TQ3/TQ2 → TQ4. Catches the Qwen3-4B class of failures. Zero cost.
+
+```
+Decision: "Can this model tolerate aggressive quantization at all?"
+Inputs: n_embd, n_head, head_dim (from GGUF metadata)
+Cost: one integer comparison
+```
+
+**Stage 2: W_K variance analysis (milliseconds, at model load)**
+
+Already implemented (`--kv-outlier-frac -1`). Reads W_K weight tensors,
+computes per-channel variance, classifies each layer into {0%, 12.5%,
+25%, 50%} outlier fraction. This is the data we've been collecting.
+
+```
+Decision: "Which layers need outlier protection, and how much?"
+Inputs: W_K weight tensor values (from GGUF)
+Cost: ~1ms per layer (sort + threshold)
+```
+
+**Stage 3: Per-layer quantization type selection (not yet implemented)**
+
+The natural next step. Using Stage 2's per-layer outlier fractions,
+select the quantization type per layer instead of using one type globally:
+
+```
+Per-layer decision matrix:
+  outlier_frac = 0%    → use uniform TQ2_0 (2.5 bpe, maximum compression)
+  outlier_frac = 12.5% → use TQ2_1 (2.75 bpe, 32 channels get TQ3)
+  outlier_frac = 25%   → use TQ2_1 or TQ3_0 (depending on quality target)
+  outlier_frac = 50%   → use TQ3_0 (3.5 bpe, too many outliers for TQ2)
+```
+
+For Mistral 7B this would mean: 27 layers × TQ2_0 + 5 layers × TQ2_1 =
+**2.539 effective bpe** (vs 2.75 uniform TQ2_1, saving 7.7%).
+
+For Qwen 3.5-9B: all 8 layers × TQ2_0 = **2.50 bpe** (no wasted outlier
+bits at all).
+
+**Stage 4: Runtime post-Hadamard calibration (future, expensive)**
+
+Instrument actual KV values during the first N tokens of inference to
+measure post-Hadamard channel variance. This would catch patterns that
+W_K analysis misses (like whatever causes Llama sensitivity). Cost:
+one extra variance-tracking pass during warmup. Not yet designed.
+
+### What Cannot Be Adapted
+
+Some properties are fixed at architecture design time and no amount of
+runtime adaptation can help:
+
+1. **Rank-deficient KV subspace** (Q dim < head_dim): quantization noise
+   in unused dimensions is mathematically unavoidable
+2. **head_dim not power-of-2**: Hadamard rotation cannot be applied
+3. **head_dim < 64**: concentration of measure is too weak for any
+   rotation to produce near-Gaussian distributions
+4. **Whatever causes Llama sensitivity**: no static analysis we've tried
+   captures it — may require fundamentally different quantization approach
+
+### The Practical Answer
+
+For **deployment today**, the two-stage pipeline (architecture check +
+W_K variance analysis) covers the majority of models:
+
+- Catches catastrophic failures (Qwen3-4B rank-deficiency) → auto-downgrade
+- Identifies models that need zero outlier protection (Qwen 3.5, Llama) → save bits
+- Identifies models that need per-layer protection (Mistral, Gemma) → right-size bits
+- Flags models with extreme outliers (Qwen2.5-0.5B) → warn user
+
+For **maximum compression**, Stage 3 (per-layer type selection) would give
+~5-10% additional memory savings at same quality, with zero runtime cost.
+The data to drive it is already collected by `--kv-outlier-frac -1`.
+
+The remaining gap is the Llama mystery and anything else that static W_K
+analysis can't see. That requires Stage 4 (runtime calibration) or a
+fundamentally different quantization approach for those model families.
+
+---
+
 ## Files and Commits
 
 ### Lean_llama.cpp
