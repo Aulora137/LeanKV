@@ -1,9 +1,9 @@
 # Experiment: Per-Layer Outlier Fraction Auto-Detection
 
 **Date:** 2026-04-12
-**Status:** Phase 1 complete (diagnostic mode), informs Phase 2/3 scope
-**Hardware:** AMD Ryzen 7 7735U, AVX2 (no AVX512), 8 threads
-**Software:** Lean_llama.cpp `feature/tq2-outlier-tiered`, commit `114437b9`
+**Status:** Phase 3 complete (per-layer adaptive K-cache types)
+**Hardware:** AMD Ryzen 7 7735U (AVX2) + Apple M2 (NEON)
+**Software:** Lean_llama.cpp `feature/tq2-outlier-tiered`, commit `8c1c55ce`
 **Branch:** both `LeanKV` and `Lean_llama.cpp` at `feature/tq2-outlier-tiered`
 
 ---
@@ -536,6 +536,77 @@ outlier K auto-detect summary: 0%=27 layers, 12.5%=5, 25%=0, 50%=0
 
 Works on any Q4_K_M or F16 GGUF model with a W_K tensor. Skips Mamba
 layers in hybrid models. Zero runtime cost — only affects load time.
+
+---
+
+## Phase 3: Per-Layer Adaptive K-Cache Type Selection
+
+**Date:** 2026-04-12
+**Commit:** `8c1c55ce` (Lean_llama.cpp)
+**Status:** Implemented and validated
+
+### What Changed
+
+Instead of using a single global `type_k` for all layers, auto-detect mode
+(`--kv-outlier-frac -1`) now assigns each layer its own K-cache type based
+on its outlier profile:
+
+| Outlier fraction | Assigned type | Bits/elem |
+|-----------------|---------------|-----------|
+| < 6.25% (flat) | TQ2_0 | 2.5 |
+| 6.25%–37.5% | TQ2_1 | 2.75 |
+| ≥ 37.5% (heavy) | TQ3_0 | 3.5 |
+
+When the user requests `--ctk tq3_0` with auto-detect:
+- Flat layers: keep TQ3_0
+- Heavy outlier layers: promote to TQ4_0
+
+No kernel changes were needed — FA and IQK kernels dispatch per-tensor
+type, so mixed per-layer types work transparently.
+
+### Implementation
+
+Two files modified in Lean_llama.cpp:
+
+1. **`src/llama-context.h`**: Added `std::vector<ggml_type> type_k_l` to
+   `llama_kv_cache` — stores the per-layer K-cache type.
+
+2. **`src/llama.cpp`**:
+   - Initialize `type_k_l` to global default in `llama_kv_cache_init()`
+   - Use `type_k_l[i]` instead of `type_k` for tensor allocation
+   - Assign per-layer types in auto-detect codepath
+   - Log "adaptive K-cache types: ..." summary when types are mixed
+   - Show "adaptive" instead of type name in KV size log
+
+### Results (M2, ctx=2048)
+
+| Model | Adaptive types | K-cache (adaptive) | K-cache (uniform TQ2_1) | Savings |
+|-------|---------------|-------------------|------------------------|---------|
+| Mistral 7B | tq2_0=27, tq2_1=5 | 20.00 MiB | 22.00 MiB | 9% |
+| Qwen 3.5-9B | tq2_0=40 | 5.00 MiB | 6.25 MiB | 20% |
+| Gemma 3-4B | tq2_0=15, tq2_1=19 | 21.25 MiB | 25.00 MiB | 15% |
+
+### Quality Validation
+
+**Mistral 7B** — adaptive vs uniform TQ2_1, temp=0, identical prompt:
+
+Both produce **token-for-token identical output**. The 27 flat layers
+safely downgraded from TQ2_1 → TQ2_0 without any quality loss, because
+those layers have no outlier channels that need mixed-precision treatment.
+
+```
+Prompt: "The three laws of thermodynamics are:"
+Adaptive (27×TQ2_0 + 5×TQ2_1): [identical output]
+Uniform (32×TQ2_1):            [identical output]
+Speed: 13.28 tok/s vs 13.46 tok/s (within noise)
+```
+
+### Log Output Example
+
+```
+llama_init_from_model: adaptive K-cache types: tq2_0=27, tq2_1=5
+llama_init_from_model: KV self size  = 150.00 MiB, K (adaptive): 22.00 MiB, V (f16): 128.00 MiB
+```
 
 ---
 
