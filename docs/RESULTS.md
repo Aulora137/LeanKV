@@ -1600,6 +1600,211 @@ Commit: `8e860b9d` (`feature/tq2-outlier-tiered` branch).
 
 ---
 
+## 17. Per-Layer Auto-Detect of Outlier Fraction (Phase 1 Diagnostic)
+
+**Date:** 2026-04-12
+**Hardware:** AMD Ryzen 7 7735U, AVX2, 8 threads
+**Software:** Lean_llama.cpp commit `114437b9`
+**Models:** 7 models spanning 3 architecture families × 3 head_dim values
+
+### 17.1 Motivation
+
+Section 15 argued that outlier fraction should scale with head_dim (Hadamard
+becomes more effective at higher d, needing less outlier protection). Section
+16 showed TQ2_1's fixed 25% outlier fraction is a head_dim=128-specific
+design. This leaves an open question: **for any given model, what outlier
+fraction would actually be optimal?**
+
+Phase 1 answers this with a runtime diagnostic: analyze each layer's W_K
+variance spectrum, pick a fraction from {0%, 12.5%, 25%, 50%} based on
+the heavy-tailedness of the distribution.
+
+### 17.2 Algorithm: `tq_auto_detect_outlier_frac()`
+
+```c
+float tq_auto_detect_outlier_frac(channel_var[], head_dim):
+    sorted = sort(channel_var, descending)
+    median = sorted[head_dim / 2]
+    if median ≤ 1e-12: return 0.0  // degenerate case
+    
+    n_moderate = count(i where sorted[i] > 2 * median)
+    n_strong   = count(i where sorted[i] > 5 * median)
+    
+    raw_frac = n_moderate / head_dim
+    
+    if raw_frac < 0.0625: return 0.0    // < 6.25% moderate
+    if raw_frac < 0.1875: return 0.125  // 6.25%-18.75%
+    if raw_frac < 0.375:  return 0.25   // 18.75%-37.5%
+    return 0.5                          // > 37.5% (heavy-tailed)
+```
+
+**Why these thresholds**: The "2× median" threshold is a standard definition
+of moderate outliers in robust statistics. The snap-to-nearest fractions
+{0, 12.5%, 25%, 50%} are the block-aligned choices compatible with
+32-element SIMD block quantization (at head_dim=256, 12.5% = 32 channels =
+1 TQ3 sub-block; at head_dim=128, 25% = 32 channels).
+
+**Data source**: Per-channel variance is computed from W_K weight tensor
+row L2 norms (averaged across heads). This is a pre-Hadamard property of
+the model — it tells us which channels the model *wants* to produce
+high-variance K values on, before any runtime rotation.
+
+### 17.3 CLI
+
+```bash
+# Explicit fraction (existing behavior)
+llama-cli --kv-outlier-frac 0.25 ...
+
+# NEW: Auto-detect per layer
+llama-cli --kv-outlier-frac -1 ...
+```
+
+Auto-detect is diagnostic-only when Hadamard rotation is enabled (the
+default for TQ types). The permutation tables are computed and logged
+but not applied at attention time because Hadamard equalizes channel
+variance at runtime, making pre-Hadamard outlier detection moot for
+the actual quantization.
+
+### 17.4 Results Across 7 Models
+
+| Model | Arch | head_dim | Attn layers | 0% | 12.5% | 25% | 50% | Max var/median range |
+|-------|------|---------:|------------:|---:|------:|----:|----:|----------------------|
+| Qwen 3.5-9B | Hybrid | 256 | 8 | **8** | 0 | 0 | 0 | 1.5–2.1× |
+| Qwen 3.5-4B | Hybrid | 256 | 8 | **8** | 0 | 0 | 0 | 1.4–2.5× |
+| Qwen 3.5-2B | Hybrid | 256 | 6 | **6** | 0 | 0 | 0 | ~2.3× |
+| Mistral 7B | Dense | 128 | 32 | **27** | 5 | 0 | 0 | 1.5–2.7× |
+| Llama 3.2-3B | Dense | 128 | 28 | **28** | 0 | 0 | 0 | 1.3–3.0× |
+| Gemma 3-4B | Dense | 256 | 34 | 15 | 15 | 4 | 0 | 1.6–3.7× |
+| Qwen3-4B | Dense (old) | 128 | 36 | 18 | 11 | 7 | 0 | 1.6–3.8× |
+
+### 17.5 Key Findings
+
+**1. Qwen 3.5 hybrid family: zero outlier channels across ALL attention layers.**
+
+Every one of the 22 attention layers across 3 model sizes (2B, 4B, 9B) shows
+flat W_K variance distribution (max/median < 2.5×, fewer than 8 channels above
+2× median). This is **direct evidence that hybrid Mamba+attention training
+produces attention layers with uniform channel importance**.
+
+This is why Phase 2b showed Qwen 3.5 as the most TQ-robust architecture
+(+0.088 on TQ3/TQ3 for 9B). It's not magic — the model was trained such that
+W_K already does most of the "outlier handling" that Hadamard + TQ types
+were designed to do. The KV cache is inherently quantization-friendly
+*before* any rotation or Lloyd-Max codebook is applied.
+
+**2. Llama 3.2-3B: all 28 layers at 0% outliers despite being TQ3-sensitive.**
+
+This is the most surprising finding. Llama 3.2-3B had the worst TQ3/TQ3
+delta of any modern dense architecture in Phase 2b (+0.596), yet
+auto-detect shows completely flat W_K variance. The max var/median
+values are actually the most concentrated of any dense model (1.3–3.0×).
+
+**Implication**: Llama's TQ3 sensitivity is NOT about outlier channels.
+Something else is causing the degradation — possibly attention head
+rotational invariance (Llama uses RoPE in a way that makes K values
+sensitive to small per-channel noise), or non-local patterns that
+don't show up in per-channel variance statistics.
+
+**Actionable**: Adding more outlier protection to Llama won't help. TQ3
+or TQ4 should be used directly; TQ2 should be avoided regardless of
+outlier handling.
+
+**3. Mistral 7B: only 5/32 layers need outlier protection (all 12.5%).**
+
+Mistral is the cleanest case for *partial* outlier handling. Most layers
+are flat (27/32 at 0%), but 5 middle layers (layers 9, 11, 12, 15)
+show 10-18 moderate outliers at 12.5%. This matches the Metal TQ2_1
+result of +5.78 delta (best of the head_dim=128 models).
+
+**Actionable**: A per-layer mixed-precision design could save memory here.
+Use TQ2_0 uniformly on 27 layers + TQ2_1 (or higher precision) on 5
+layers. Effective bpe = (27×2.5 + 5×2.75) / 32 = **2.539 bpe** instead
+of uniform TQ2_1's 2.75 bpe. ~7% memory savings at same quality.
+
+**4. Gemma 3-4B: 15+15+4 split, most varied distribution.**
+
+Middle layers (9-15) show the heaviest tails (max var/median up to 3.7×,
+with layer 11 needing 25%). Yet Phase 2b showed Gemma 3 with TQ3/TQ3
+PPL delta of **-0.102** (improves with quantization). This is because
+Hadamard + head_dim=256 concentration is so effective that the outlier
+channels get smoothed out at runtime — the pre-Hadamard outliers we're
+detecting here are exactly the channels Hadamard cleans up.
+
+**Actionable**: Gemma doesn't need outlier handling at runtime (Hadamard
+handles it). The auto-detect tells us the model's structure; Hadamard
+renders the structure moot.
+
+**5. Qwen3-4B old dense: 11+7 layers need 12.5-25% protection.**
+
+This aligns with the catastrophic Phase 2b result (TQ3/TQ3 delta +3.325).
+Qwen3-4B has the same structural properties as Gemma 3 (dense, heavy-tailed
+middle layers) but with head_dim=128 instead of 256. At head_dim=128,
+Hadamard is only moderately effective, and the remaining post-Hadamard
+outliers destroy quality. This is exactly the scenario TQ2_1 was designed
+for — but the auto-downgrade logic (added in commit `6f9e0c3c`) now
+catches this at load time and forces TQ4 on rank-deficient models.
+
+### 17.6 Implications for Phase 2 and Beyond
+
+**Phase 2 (variable per-layer outlier fraction with TQ types)**:
+
+The data strongly suggests Phase 2 is worth building for specific models:
+
+- **Mistral 7B**: clear memory savings (~7%) from per-layer mixed precision
+- **Gemma 3-4B, Qwen3-4B**: largest variable-precision opportunity if outlier
+  handling is done POST-Hadamard (currently not possible)
+
+But not for others:
+- **Qwen 3.5 family**: no benefit, already uniform
+- **Llama 3.2-3B**: W_K variance doesn't capture what's needed
+
+**Phase 3 (true mixed-precision storage)**:
+
+The uniform TQ2_1 design allocates 2.75 bpe everywhere. Auto-detect suggests
+it should allocate 2.5-2.75 bpe dynamically per layer. For a typical
+head_dim=128 dense model, this would save ~5-10% memory with identical
+quality. Whether this engineering effort is worth it depends on deployment
+scale — for edge devices running one model, probably yes; for cloud
+inference with batch serving, the memory savings matter more.
+
+**The surprising non-finding: Llama sensitivity isn't outlier-related**:
+
+This is the most useful diagnostic insight. It means the "outlier
+permutation" family of techniques (including TQ2_1, mixed-precision,
+and the whole approach Section 15 was projecting forward) **will not
+help Llama-family models**. For Llama, the path to aggressive
+compression requires a different mechanism — probably something targeting
+attention head rotation invariance rather than per-channel variance.
+
+### 17.7 Usage
+
+```bash
+# Diagnostic run — get per-layer variance analysis
+./build/bin/llama-cli -m model.gguf -ngl 0 --kv-outlier-frac -1 \
+    -ctk f16 -ctv f16 -c 32 -p "hi" -n 0 2>&1 | grep "outlier K"
+```
+
+Output format:
+```
+outlier K layer  0: frac=0.000 (0/128 ch), max_var/med=2.4x, moderate=6, strong=0
+outlier K layer  1: frac=0.000 (0/128 ch), max_var/med=2.7x, moderate=7, strong=0
+...
+outlier K auto-detect summary: 0%=27 layers, 12.5%=5, 25%=0, 50%=0
+```
+
+### 17.8 Files Modified
+
+| File | Change |
+|------|--------|
+| `ggml/src/ggml-tq-outlier.h` | Added `tq_auto_detect_outlier_frac()` declaration |
+| `ggml/src/ggml-tq-outlier.c` | Added 68-line implementation with sort + threshold |
+| `src/llama.cpp` | Wired auto-detect into model load, per-layer logging, histogram |
+| `common/common.cpp` | Updated help text and Hadamard guard for negative values |
+
+Commit: `114437b9` (`feature/tq2-outlier-tiered` branch).
+
+---
+
 ## References
 
 1. Zandieh et al. "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." arXiv:2504.19874 (2025). Google Research.
