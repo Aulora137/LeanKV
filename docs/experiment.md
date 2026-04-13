@@ -608,6 +608,77 @@ llama_init_from_model: adaptive K-cache types: tq2_0=27, tq2_1=5
 llama_init_from_model: KV self size  = 150.00 MiB, K (adaptive): 22.00 MiB, V (f16): 128.00 MiB
 ```
 
+### Update (2026-04-12): Timing Bug Fix
+
+**Commit:** `cecf6180` (Lean_llama.cpp)
+
+During PPL validation of the Phase 3 adaptive selection, a timing bug was
+discovered: the auto-detect block ran *after* `llama_kv_cache_init()`, but
+tensor allocation happens *inside* `llama_kv_cache_init()` using
+`type_k_l[i]` values. The modifications to `type_k_l` were no-ops because
+the tensors already existed with the uniform type.
+
+Symptoms seen with `--ctk tq2_0 --kv-outlier-frac -1` on Mistral 7B:
+
+```
+# Before fix
+outlier K auto-detect summary: 0%=27 layers, 12.5%=5, 25%=0, 50%=0
+KV self size = 148.00 MiB, K (tq2_0): 20.00 MiB    ← uniform, log line missing
+
+# After fix
+outlier K auto-detect summary: 0%=27 layers, 12.5%=5, 25%=0, 50%=0
+adaptive K-cache types: tq2_0=27, tq2_1=5           ← now fires
+KV self size = 148.31 MiB, K (adaptive): 20.31 MiB  ← 0.31 MiB = 5 × (22-20)/32
+```
+
+The 0.31 MiB increment over uniform TQ2_0 is exactly `5 × (TQ2_1 block size
+- TQ2_0 block size) / n_layers`, confirming the per-layer tensor creation
+now honors adaptive types.
+
+**Two bugs fixed in `cecf6180`:**
+
+1. **Timing**: moved auto-detect block to run *before* `llama_kv_cache_init()`
+2. **Base type source**: the promotion logic read `base_type` from
+   `ctx->kv_self.type_k`, but that field is set inside `llama_kv_cache_init()`.
+   Before the cache is init'd, it's default-initialized (`GGML_TYPE_F32 = 0`),
+   which doesn't match any TQ type — so the promotion block silently
+   skipped every layer. Fix: use the local function argument `type_k`
+   directly.
+
+**Note on pre-fix numbers**: The "token-for-token identical" claim in the
+M2 results table above was actually comparing two uniform TQ2_0 runs (the
+"adaptive" one was broken and fell through to uniform). The real quality
+comparison has to be done with the fixed build.
+
+### Post-Fix Quick Validation (3 chunks, Mistral 7B, Ryzen)
+
+| Config | K-cache | PPL | Delta vs F16 |
+|--------|--------:|----:|-------------:|
+| F16/F16 | 128.00 | 6.62 | — |
+| TQ2_0/F16 uniform | 20.00 | 8.15 | +1.53 |
+| **Adaptive/F16** | **20.31** | **8.05** | **+1.43** |
+| TQ2_1/F16 uniform | 22.00 | 7.56 | +0.94 |
+
+**Preliminary findings** (3-chunk, stderr ±0.35, not statistically conclusive):
+
+- Adaptive delivers **marginal quality improvement** over uniform TQ2_0
+  (-0.10 PPL) for **marginal memory cost** (+0.31 MiB = +1.5%)
+- Adaptive does **NOT match uniform TQ2_1 quality** (-0.49 PPL gap)
+- Efficiency: adaptive captures ~17% of TQ2_0→TQ2_1 quality gain for
+  ~15% of the memory cost — roughly equal per-bit efficiency, not
+  dramatically better
+
+**Interpretation**: the 2× median threshold may be too strict. Some
+"flat" layers might still benefit from TQ2_1 precision even without
+structural outliers. A lower threshold (1.5× median?) could promote
+more layers, trading memory for quality.
+
+**Important caveat**: 3-chunk PPL stderr is ±0.35, so the deltas between
+TQ2_0 / Adaptive / TQ2_1 are not statistically significant. A full
+145-chunk run is needed before drawing firm conclusions. The direction
+of the results is consistent with theory, but the magnitudes need
+validation.
+
 ---
 
 ## References
