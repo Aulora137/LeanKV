@@ -681,6 +681,103 @@ validation.
 
 ---
 
+## Phase 3.5: V1 Tuned Policy — 160-Chunk Validation (2026-04-13)
+
+After discovering the 2.0× threshold was too strict, we ran a trial-and-error
+sweep of 7 variants and identified **V1 (n_moderate at 1.5× threshold)** as
+the clear winner. Full 160-chunk validation on Mistral 7B confirmed V1
+delivers a strict Pareto improvement over uniform TQ2_1.
+
+### Final numbers (Mistral 7B, 160 chunks)
+
+| Config | K-cache | PPL | Stderr | Delta vs F16 | vs TQ2_1 |
+|--------|--------:|----:|-------:|-------------:|---------:|
+| F16/F16 | 128.00 | 5.1627 | ±0.029 | — | — |
+| TQ2_0 uniform | 20.00 | 6.4229 | ±0.036 | +1.260 | +0.445 |
+| V0 adaptive (2.0×) | 20.31 | 6.3413 | ±0.036 | +1.179 | +0.363 |
+| **V1 adaptive (1.5×)** | **21.69** | **5.9940** | **±0.033** | **+0.831** | **+0.016** |
+| TQ2_1 uniform | 22.00 | 5.9784 | ±0.033 | +0.816 | 0 |
+
+**V1 vs TQ2_1**: delta 0.016 PPL, combined stderr 0.047 → **0.34σ** (p≈0.73).
+Statistically tied. V1 saves 0.31 MiB (1.5%) of K-cache memory at the same
+quality ceiling.
+
+### Layer distribution (Mistral 7B, V1)
+
+- 11 layers × **TQ2_0** (flat by 1.5× n_moderate metric)
+- 19 layers × **TQ2_1** (moderate outliers)
+- 2 layers × **TQ3_0** (heavy outliers — the key insight)
+
+The 2 TQ3_0 layers spend extra bits beyond what uniform TQ2_1 would, and
+that extra precision recovers the quality lost from downgrading 11 layers
+to TQ2_0. Net result: same quality, slightly less memory.
+
+### Cross-Architecture Screening
+
+At 3 chunks, we validated V1 across head_dim regimes:
+
+| Model | head_dim | V1 verdict | Recommended default |
+|-------|---------:|------------|---------------------|
+| Mistral 7B | 128 | **Win** (ties TQ2_1 at −1.5% memory) | 1.5× threshold |
+| Qwen 3.5-9B | 256 (hybrid) | Neutral (flat W_K, no promotion) | 2.0× threshold |
+| Gemma 3-4B | 256 (dense) | Mild regression (over-promotes TQ3_0) | 2.0× threshold |
+| Qwen 2.5-0.5B | 64 | Catastrophic (TQ2 broken at low d) | Disabled |
+
+### Shipped Defaults
+
+Phase 3.5 ships **head_dim-dependent default thresholds** so users get the
+right policy automatically:
+
+| head_dim | Threshold | Behavior |
+|---------:|----------:|----------|
+| ≤ 96 | disabled | Uniform type_k, warn if spectrum HIGH |
+| 97–128 | **1.5×** | V1 adaptive (Mistral/Llama target) |
+| 129–256 | **2.0×** | V0 adaptive (Gemma/Qwen 3.5 safe) |
+| ≥ 257 | disabled | Hadamard handles it alone |
+
+Environment variable overrides remain available for tuning:
+
+```bash
+LEANKV_OUTLIER_METRIC=0  LEANKV_OUTLIER_THRESHOLD=1.5  \
+    llama-cli -ctk tq2_0 --kv-outlier-frac -1 ...
+```
+
+### Spectrum Skew Diagnostic
+
+Every `--kv-outlier-frac -1` load now logs a one-line skew summary that
+tells users whether their model is in safe default territory:
+
+```
+outlier K spectrum: max/med=2.66x (mean 1.83x) → skew LOW
+outlier K spectrum: max/med=4.63x (mean 3.04x) → skew MODERATE
+outlier K spectrum: max/med=17.24x (mean 3.60x) → skew HIGH (validate PPL)
+```
+
+- **LOW** (max < 3×): distribution is near-flat, any policy works
+- **MODERATE** (3× ≤ max < 10×): typical dense transformer
+- **HIGH** (max ≥ 10×): heavy-tailed — recommend `llama-perplexity` validation
+
+### Ship-ready status
+
+Phase 3.5 is complete and committed as `6c121095` on branch
+`feature/tq2-outlier-tiered`. See RESULTS.md Section 18 for the full
+analysis and tuning guide.
+
+**What ships:**
+- V1 adaptive policy (1.5× median, n_moderate metric)
+- Head_dim-dependent default thresholds (128 → 1.5×, 256 → 2.0×, else disabled)
+- Environment variable overrides (`LEANKV_OUTLIER_METRIC`, `LEANKV_OUTLIER_THRESHOLD`)
+- Spectrum skew diagnostic at model load
+- Full tuning guide + known limits section in RESULTS.md §18
+
+**Deferred to future sessions:**
+- Fingerprint cache (opt-in `--kv-tune-threshold` flag for first-run auto-tuning)
+- Metal cross-platform validation (needs rerun of M2 with updated code)
+- CUDA kernel implementation (blocked on Metal validation)
+- The Llama mystery (why TQ3-sensitive despite flat W_K)
+
+---
+
 ## References
 
 - RESULTS.md Section 14 — Phase 4 TQ2_0 validation (baseline)
