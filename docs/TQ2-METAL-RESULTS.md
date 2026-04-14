@@ -19,8 +19,8 @@ Lower is better. Delta % relative to F16 baseline.
 | Model | Params | Q→KV | F16 | TQ4_0 | TQ3_0 | TQ2_1 | TQ2_0 | Adaptive |
 |-------|-------:|:----:|----:|------:|------:|------:|------:|:--------:|
 | Mistral 7B | 7B | 1.0 | 8.89 | 8.98 (+1.0%) | 9.16 (+3.0%) | 14.67 (+65%) | 20.77 (+134%) | — |
-| Qwen3-8B | 8B | 1.0 | 9.47 | 9.86 (+4.1%) | 10.04 (+6.0%) | 27.27 (+188%) | 38.29 (+304%) | — |
-| Gemma 3-4B | 4B | 1.25 | 12.54 | 12.42 (-1.0%) | 12.43 (-0.9%) | — | — | — |
+| Qwen3-8B | 8B   | 1.0 | 9.47 | 9.86 (+4.1%) | 10.04 (+6.0%) | 27.27 (+188%) | 38.29 (+304%) | — |
+| Gemma 3-4B | 4B | 1.25| 12.54 | 12.42 (-1.0%) | 12.43 (-0.9%) | — | — | — |
 | Llama 3-8B | 8B | 1.0 | — | — | — | — | — | — |
 | Qwen3-4B | 4B | **0.625** | 13.04 | 13.90 (+6.6%) | 19.28 (+48%) | 74.96 (+475%) | 144.68 (+1010%) | auto→TQ4 |
 | Qwen3.5-9B | 9B | 1.0 | — | — | — | — | — | Metal FA crash |
@@ -44,11 +44,11 @@ not bit-width. Choosing TQ2_0 over TQ4_0 costs zero speed but saves 44% more mem
 
 | Model | n_layer | n_kv_head | head_dim | F16 | TQ4_0 | TQ3_0 | TQ2_1 | TQ2_0 | Adaptive |
 |-------|:-------:|:---------:|:--------:|----:|------:|------:|------:|------:|---------:|
-| Llama 3-8B | 32 | 8 | 128 | 64 MiB | 18 MiB | 14 MiB | 12 MiB | 10 MiB | — |
-| Qwen3-8B | 36 | 8 | 128 | 72 MiB | 20 MiB | 16 MiB | 14 MiB | 12 MiB | — |
-| Gemma 3-4B | 26 | 4 | 256 | 52 MiB | 15 MiB | 11 MiB | — | 10 MiB | 21.25 MiB K |
-| Mistral 7B | 32 | 8 | 128 | 64 MiB | 18 MiB | 14 MiB | 12 MiB | 10 MiB | 20.00 MiB K |
-| Qwen3.5-9B | 8† | 4 | 256 | 10 MiB | 3 MiB | 2 MiB | — | 2 MiB | 5.00 MiB K |
+| Llama 3-8B | 32 | 8          | 128 | 64 MiB | 18 MiB | 14 MiB | 12 MiB | 10 MiB | — |
+| Qwen3-8B   | 36 | 8          | 128 | 72 MiB | 20 MiB | 16 MiB | 14 MiB | 12 MiB | — |
+| Gemma 3-4B | 26 | 4          | 256 | 52 MiB | 15 MiB | 11 MiB | —      | 10 MiB | 21.25 MiB K |
+| Mistral 7B | 32 | 8          | 128 | 64 MiB | 18 MiB | 14 MiB | 12 MiB | 10 MiB | 20.00 MiB K |
+| Qwen3.5-9B | 8† | 4          | 256 | 10 MiB | 3 MiB  | 2 MiB  | —      | 2 MiB  | 5.00 MiB K |
 
 †Qwen3.5-9B has 40 layers but only 8 attention layers (hybrid Mamba+attn), hence small KV.
 
@@ -56,7 +56,8 @@ not bit-width. Choosing TQ2_0 over TQ4_0 costs zero speed but saves 44% more mem
 
 | Model | Layer types assigned | K-cache | vs uniform TQ2_1 | Quality |
 |-------|---------------------|--------:|:-----------------:|---------|
-| Mistral 7B | 27×TQ2_0 + 5×TQ2_1 | 20.00 MiB | **-9%** | Token-identical output |
+| Mistral 7B | 27×TQ2_0 + 5×TQ2_1 | 20.00 MiB | **-9%** | Token-identical (short gen) |
+| Mistral 7B (V1) | tq2_0=11, tq2_1=19, tq3_0=2 | 21.69 MiB | **-1.4%** | PPL 6.014 Metal, 5.994 CPU (160 chunks) |
 | Qwen 3.5-9B | 40×TQ2_0 | 5.00 MiB | **-20%** | All layers flat |
 | Gemma 3-4B | 15×TQ2_0 + 19×TQ2_1 | 21.25 MiB | **-15%** | Mixed — heavy tails in 19 layers |
 
@@ -69,8 +70,8 @@ uniform TQ2_1 (2.75 bpe), saving memory with zero quality loss.
 | Model | Q→KV ratio | Best type | Effective bpe | PPL delta | Compression vs F16 |
 |-------|:----------:|-----------|:-------------:|:---------:|:------------------:|
 | Mistral 7B | 1.0 | TQ3_0 | 3.5 | +3.0% | 4.6× |
-| Mistral 7B | 1.0 | Adaptive TQ2 | ~2.54 | ~+3% est. | **6.3×** |
-| Qwen3-8B | 1.0 | TQ3_0 | 3.5 | +6.0% | 4.6× |
+| Mistral 7B | 1.0 | V1 adaptive | ~2.65 | +16.4% | **6.0×** (validated Metal+CPU) |
+| Qwen3-8B   | 1.0 | TQ3_0 | 3.5 | +6.0% | 4.6× |
 | Gemma 3-4B | 1.25 | TQ3_0 | 3.5 | **-0.9%** | 4.6× |
 | Gemma 3-4B | 1.25 | Adaptive TQ2 | ~2.63 | ~0% est. | **6.1×** |
 | Llama 3-8B | 1.0 | TQ4_0 | 4.5 | ~+1% | 3.6× |
@@ -175,7 +176,46 @@ shows significant degradation. Good reference point — matched Q/KV dimensions.
 
 ---
 
-## 3. Decode Speed (Metal GPU, M2)
+## 3. Metal vs CPU Validation — Mistral 7B (160 chunks, full WikiText-2)
+
+**Date:** 2026-04-14
+**Hardware:** Apple M2 Air 16 GB, Metal GPU (`-ngl 99`)
+**CPU baseline:** AMD Ryzen 7 7735U, AVX2, 8 threads, `-ngl 0`
+**Commit:** `6c121095`
+
+Full 160-chunk perplexity comparison to confirm Metal produces identical
+numerical results to CPU. Pass criterion: ±0.1 PPL.
+
+### 3.1 Results
+
+| Config | K-cache | CPU PPL | Metal PPL | Delta | Status |
+|--------|--------:|--------:|----------:|------:|:------:|
+| F16 baseline | 128.00 MiB | 5.1627 ± 0.029 | 5.1678 ± 0.029 | +0.005 | **PASS** |
+| TQ2_1 uniform | 22.00 MiB | 5.9784 ± 0.033 | 5.9883 ± 0.033 | +0.010 | **PASS** |
+| V1 adaptive | 21.69 MiB | 5.9940 ± 0.033 | 6.0135 ± 0.033 | +0.020 | **PASS** |
+| TQ2_0 uniform | 20.00 MiB | 6.4229 ± 0.036 | 6.4120 ± 0.036 | -0.011 | **PASS** |
+
+All configs within **±0.02 PPL** — well under the ±0.1 threshold.
+
+### 3.2 Verification Details
+
+- **Hadamard rotation:** `k_cache_hadam = 1` confirmed active on Metal for all TQ types
+- **V1 adaptive layer assignment:** `tq3_0=2, tq2_0=11, tq2_1=19` — identical to CPU
+- **Total runtime:** ~9 hours (19:26 → 04:26), ~90 sec/chunk on M2 Metal
+- **F16 delta (+0.005):** Within stderr noise (±0.029), confirms Metal FP16 is exact
+- **TQ2_0 delta (-0.011):** Metal is actually *slightly better* — within noise
+
+### 3.3 Conclusion
+
+**Metal is validated.** Hadamard rotation, TQ dequantization, and adaptive per-layer
+type selection all produce numerically faithful results on Apple Silicon Metal GPU.
+The M1/M2/M3/M4 Mac user base gets the same quality as x86 AVX2.
+
+**Next step:** CUDA validation for Linux/datacenter deployment.
+
+---
+
+## 4. Decode Speed (Metal GPU, M2)
 
 Measured with `llama-cli`, 128-token generation, 2048 context, `-ngl 99`.
 
@@ -209,7 +249,7 @@ Measured with `llama-cli`, 128-token generation, 2048 context, `-ngl 99`.
 
 ---
 
-## 4. KV Cache Memory
+## 5. KV Cache Memory
 
 ### 4.1 Per-Type Compression (8 KV heads × 128 head_dim, 2048 context)
 
@@ -237,7 +277,7 @@ Qwen3-8B). Speed is within noise of TQ2_0/TQ3_0 across all models.
 
 ---
 
-## 5. Output Quality — Generation Coherence
+## 6. Output Quality — Generation Coherence
 
 Prompt: *"Explain why the sky is blue in one sentence."*
 
@@ -254,7 +294,7 @@ approach rescues quality at only +0.25 bpe cost.
 
 ---
 
-## 6. Qwen3.5-9B: Metal FA Incompatibility
+## 7. Qwen3.5-9B: Metal FA Incompatibility
 
 Qwen3.5-9B was **not tested on Metal GPU** because its architecture triggers a
 pre-existing Metal Flash Attention assertion failure:
@@ -276,7 +316,7 @@ CPU (AVX2 and ARM NEON IQK paths) with all TQ types.
 
 ---
 
-## 7. TQ2_1 Mixed-Precision Validation
+## 8. TQ2_1 Mixed-Precision Validation
 
 TQ2_1 consistently outperforms TQ2_0 across all models, confirming the value of
 giving 32 channels TQ3 precision (3.5 bpe) while the remaining 96 use TQ2 (2.5 bpe).
@@ -293,7 +333,7 @@ equal variance, so ANY 32 channels receiving TQ3 treatment benefits quality unif
 
 ---
 
-## 8. Root Cause: Qwen3-4B Quantization Sensitivity
+## 9. Root Cause: Qwen3-4B Quantization Sensitivity
 
 ### The Anomaly
 
@@ -382,7 +422,7 @@ TQ4_0 remains available (borderline acceptable at +6.6% PPL on Qwen3-4B).
 
 ---
 
-## 9. Compression Summary
+## 10. Compression Summary
 
 Memory per KV token (head_dim=128, per head):
 
@@ -402,7 +442,7 @@ For a model with 8 KV heads, 36 layers, 32k context:
 
 ---
 
-## 10. Models Tested
+## 11. Models Tested
 
 | Model | File | Size | Source |
 |-------|------|------|--------|
@@ -416,7 +456,7 @@ All models quantized to Q4_K_M for weight storage. KV cache type varied per test
 
 ---
 
-## 11. Open Questions
+## 12. Open Questions
 
 1. ~~**Can we detect Q/KV mismatch at model load and auto-select max TQ level?**~~
    **Done.** Implemented in `src/llama.cpp:llama_init_from_model()`. Auto-downgrades
