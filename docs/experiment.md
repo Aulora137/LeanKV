@@ -608,173 +608,170 @@ llama_init_from_model: adaptive K-cache types: tq2_0=27, tq2_1=5
 llama_init_from_model: KV self size  = 150.00 MiB, K (adaptive): 22.00 MiB, V (f16): 128.00 MiB
 ```
 
-### Update (2026-04-12): Timing Bug Fix
-
-**Commit:** `cecf6180` (Lean_llama.cpp)
-
-During PPL validation of the Phase 3 adaptive selection, a timing bug was
-discovered: the auto-detect block ran *after* `llama_kv_cache_init()`, but
-tensor allocation happens *inside* `llama_kv_cache_init()` using
-`type_k_l[i]` values. The modifications to `type_k_l` were no-ops because
-the tensors already existed with the uniform type.
-
-Symptoms seen with `--ctk tq2_0 --kv-outlier-frac -1` on Mistral 7B:
-
-```
-# Before fix
-outlier K auto-detect summary: 0%=27 layers, 12.5%=5, 25%=0, 50%=0
-KV self size = 148.00 MiB, K (tq2_0): 20.00 MiB    ← uniform, log line missing
-
-# After fix
-outlier K auto-detect summary: 0%=27 layers, 12.5%=5, 25%=0, 50%=0
-adaptive K-cache types: tq2_0=27, tq2_1=5           ← now fires
-KV self size = 148.31 MiB, K (adaptive): 20.31 MiB  ← 0.31 MiB = 5 × (22-20)/32
-```
-
-The 0.31 MiB increment over uniform TQ2_0 is exactly `5 × (TQ2_1 block size
-- TQ2_0 block size) / n_layers`, confirming the per-layer tensor creation
-now honors adaptive types.
-
-**Two bugs fixed in `cecf6180`:**
-
-1. **Timing**: moved auto-detect block to run *before* `llama_kv_cache_init()`
-2. **Base type source**: the promotion logic read `base_type` from
-   `ctx->kv_self.type_k`, but that field is set inside `llama_kv_cache_init()`.
-   Before the cache is init'd, it's default-initialized (`GGML_TYPE_F32 = 0`),
-   which doesn't match any TQ type — so the promotion block silently
-   skipped every layer. Fix: use the local function argument `type_k`
-   directly.
-
-**Note on pre-fix numbers**: The "token-for-token identical" claim in the
-M2 results table above was actually comparing two uniform TQ2_0 runs (the
-"adaptive" one was broken and fell through to uniform). The real quality
-comparison has to be done with the fixed build.
-
-### Post-Fix Quick Validation (3 chunks, Mistral 7B, Ryzen)
-
-| Config | K-cache | PPL | Delta vs F16 |
-|--------|--------:|----:|-------------:|
-| F16/F16 | 128.00 | 6.62 | — |
-| TQ2_0/F16 uniform | 20.00 | 8.15 | +1.53 |
-| **Adaptive/F16** | **20.31** | **8.05** | **+1.43** |
-| TQ2_1/F16 uniform | 22.00 | 7.56 | +0.94 |
-
-**Preliminary findings** (3-chunk, stderr ±0.35, not statistically conclusive):
-
-- Adaptive delivers **marginal quality improvement** over uniform TQ2_0
-  (-0.10 PPL) for **marginal memory cost** (+0.31 MiB = +1.5%)
-- Adaptive does **NOT match uniform TQ2_1 quality** (-0.49 PPL gap)
-- Efficiency: adaptive captures ~17% of TQ2_0→TQ2_1 quality gain for
-  ~15% of the memory cost — roughly equal per-bit efficiency, not
-  dramatically better
-
-**Interpretation**: the 2× median threshold may be too strict. Some
-"flat" layers might still benefit from TQ2_1 precision even without
-structural outliers. A lower threshold (1.5× median?) could promote
-more layers, trading memory for quality.
-
-**Important caveat**: 3-chunk PPL stderr is ±0.35, so the deltas between
-TQ2_0 / Adaptive / TQ2_1 are not statistically significant. A full
-145-chunk run is needed before drawing firm conclusions. The direction
-of the results is consistent with theory, but the magnitudes need
-validation.
-
 ---
 
-## Phase 3.5: V1 Tuned Policy — 160-Chunk Validation (2026-04-13)
+## Phase 5: The V1 Scorecard Correction (2026-04-15)
 
-After discovering the 2.0× threshold was too strict, we ran a trial-and-error
-sweep of 7 variants and identified **V1 (n_moderate at 1.5× threshold)** as
-the clear winner. Full 160-chunk validation on Mistral 7B confirmed V1
-delivers a strict Pareto improvement over uniform TQ2_1.
+After Phase 3.5 shipped V1 as the new adaptive default, cross-architecture
+validation on CUDA revealed that **V1's Mistral win does NOT generalize**.
+The Phase 3.5 documentation needs correction.
 
-### Final numbers (Mistral 7B, 160 chunks)
+### The cross-model CUDA batch (RTX 4090, 160 chunks WikiText-2)
 
-| Config | K-cache | PPL | Stderr | Delta vs F16 | vs TQ2_1 |
-|--------|--------:|----:|-------:|-------------:|---------:|
-| F16/F16 | 128.00 | 5.1627 | ±0.029 | — | — |
-| TQ2_0 uniform | 20.00 | 6.4229 | ±0.036 | +1.260 | +0.445 |
-| V0 adaptive (2.0×) | 20.31 | 6.3413 | ±0.036 | +1.179 | +0.363 |
-| **V1 adaptive (1.5×)** | **21.69** | **5.9940** | **±0.033** | **+0.831** | **+0.016** |
-| TQ2_1 uniform | 22.00 | 5.9784 | ±0.033 | +0.816 | 0 |
+Full 5-model + Qwen 3.5-9B supplemental validation on a single Vast.ai
+RTX 4090 instance. Total wall time: 39 minutes.
 
-**V1 vs TQ2_1**: delta 0.016 PPL, combined stderr 0.047 → **0.34σ** (p≈0.73).
-Statistically tied. V1 saves 0.31 MiB (1.5%) of K-cache memory at the same
-quality ceiling.
+| Model | head_dim | V1 adaptive PPL | Uniform TQ2_1 PPL | Delta | Verdict |
+|-------|---------:|----------------:|------------------:|------:|:-------:|
+| Mistral 7B (dense) | 128 | 6.005 | 5.973 | **+0.032** (tied) | ✅ |
+| Qwen3-8B (dense) | 128 | 16.48 | 13.72 | **+2.77 (WORSE)** | ❌ |
+| Gemma 3-4B (dense) | 256 | 14.39 | 14.00 | +0.39 (slightly worse) | ➖ |
+| Llama 3-8B (dense) | 128 | 12.25 | 10.00 | **+2.25 (WORSE)** | ❌ |
+| Qwen3-4B (rank-def.) | 128 | auto-forced TQ4 | auto-forced TQ4 | — | ✅ (safety) |
+| Qwen 3.5-9B (hybrid) | 256 | 7.324 | 7.221 | +0.10 (= TQ2_0) | ➖ |
 
-### Layer distribution (Mistral 7B, V1)
+**V1 is strictly useful on 1 of 6 models**, neutral on 3, and **actively
+harmful on 2** (Qwen3-8B and Llama 3-8B).
 
-- 11 layers × **TQ2_0** (flat by 1.5× n_moderate metric)
-- 19 layers × **TQ2_1** (moderate outliers)
-- 2 layers × **TQ3_0** (heavy outliers — the key insight)
+### Why V1 fails on Llama 3-8B (the "Llama mystery" confirmed)
 
-The 2 TQ3_0 layers spend extra bits beyond what uniform TQ2_1 would, and
-that extra precision recovers the quality lost from downgrading 11 layers
-to TQ2_0. Net result: same quality, slightly less memory.
-
-### Cross-Architecture Screening
-
-At 3 chunks, we validated V1 across head_dim regimes:
-
-| Model | head_dim | V1 verdict | Recommended default |
-|-------|---------:|------------|---------------------|
-| Mistral 7B | 128 | **Win** (ties TQ2_1 at −1.5% memory) | 1.5× threshold |
-| Qwen 3.5-9B | 256 (hybrid) | Neutral (flat W_K, no promotion) | 2.0× threshold |
-| Gemma 3-4B | 256 (dense) | Mild regression (over-promotes TQ3_0) | 2.0× threshold |
-| Qwen 2.5-0.5B | 64 | Catastrophic (TQ2 broken at low d) | Disabled |
-
-### Shipped Defaults
-
-Phase 3.5 ships **head_dim-dependent default thresholds** so users get the
-right policy automatically:
-
-| head_dim | Threshold | Behavior |
-|---------:|----------:|----------|
-| ≤ 96 | disabled | Uniform type_k, warn if spectrum HIGH |
-| 97–128 | **1.5×** | V1 adaptive (Mistral/Llama target) |
-| 129–256 | **2.0×** | V0 adaptive (Gemma/Qwen 3.5 safe) |
-| ≥ 257 | disabled | Hadamard handles it alone |
-
-Environment variable overrides remain available for tuning:
-
-```bash
-LEANKV_OUTLIER_METRIC=0  LEANKV_OUTLIER_THRESHOLD=1.5  \
-    llama-cli -ctk tq2_0 --kv-outlier-frac -1 ...
-```
-
-### Spectrum Skew Diagnostic
-
-Every `--kv-outlier-frac -1` load now logs a one-line skew summary that
-tells users whether their model is in safe default territory:
+V1 on Llama 3-8B produced this distribution:
 
 ```
-outlier K spectrum: max/med=2.66x (mean 1.83x) → skew LOW
-outlier K spectrum: max/med=4.63x (mean 3.04x) → skew MODERATE
-outlier K spectrum: max/med=17.24x (mean 3.60x) → skew HIGH (validate PPL)
+outlier K spectrum: max/med=2.78x (mean 1.53x) → skew LOW
+outlier K auto-detect summary: 0%=30 layers, 12.5%=2, 25%=0, 50%=0
+adaptive K-cache types: tq2_0=30, tq2_1=2
 ```
 
-- **LOW** (max < 3×): distribution is near-flat, any policy works
-- **MODERATE** (3× ≤ max < 10×): typical dense transformer
-- **HIGH** (max ≥ 10×): heavy-tailed — recommend `llama-perplexity` validation
+**30 of 32 layers were classified as "flat" and downgraded to TQ2_0.** V1
+effectively becomes uniform TQ2_0 with 2 "safety" TQ2_1 layers. The result:
+PPL 12.2528 (+65%) vs uniform TQ2_1's 10.0031 (+35%). V1 is nearly as bad
+as uniform TQ2_0 (12.71, +72%) because it IS nearly uniform TQ2_0.
 
-### Ship-ready status
+But here's the mystery: **W_K variance on Llama is genuinely flat**. The
+spectrum skew label is LOW. There are no per-channel outliers to detect.
+V1 is making the right call based on the signal it can see. Yet Llama 3
+is severely TQ-sensitive (+35% even at uniform TQ2_1). The sensitivity
+lives in some mechanism V1 doesn't measure.
 
-Phase 3.5 is complete and committed as `6c121095` on branch
-`feature/tq2-outlier-tiered`. See RESULTS.md Section 18 for the full
-analysis and tuning guide.
+Hypotheses for future investigation:
+1. **W_Q variance instead of W_K** — maybe the Q-side outliers are the
+   real signal on Llama
+2. **Post-Hadamard runtime variance** — instrument actual KV values during
+   the first N inference tokens
+3. **Attention head rotation** — Llama 3's RoPE configuration interacts
+   with Lloyd-Max codebooks in a way that static weight analysis can't
+   capture
+4. **Training dynamics** — Llama 3's training recipe produces a
+   quantization-sensitive attention pattern that isn't visible in the
+   final weights
 
-**What ships:**
-- V1 adaptive policy (1.5× median, n_moderate metric)
-- Head_dim-dependent default thresholds (128 → 1.5×, 256 → 2.0×, else disabled)
-- Environment variable overrides (`LEANKV_OUTLIER_METRIC`, `LEANKV_OUTLIER_THRESHOLD`)
-- Spectrum skew diagnostic at model load
-- Full tuning guide + known limits section in RESULTS.md §18
+The Llama mystery is **confirmed across CPU, Metal, and CUDA backends**
+and is the most important open question from this project.
 
-**Deferred to future sessions:**
-- Fingerprint cache (opt-in `--kv-tune-threshold` flag for first-run auto-tuning)
-- Metal cross-platform validation (needs rerun of M2 with updated code)
-- CUDA kernel implementation (blocked on Metal validation)
-- The Llama mystery (why TQ3-sensitive despite flat W_K)
+### Why V1 fails on Qwen3-8B
+
+V1 on Qwen3-8B produced `tq2_0=11, tq2_1=25`. 11 layers got downgraded
+from TQ2_1 to TQ2_0. On this model, TQ2_0 degrades PPL by **+117%**
+(vs TQ2_1's +59%). The 11 downgraded layers compound enough error to
+push V1 to +91% — halfway between TQ2_1 and uniform TQ2_0.
+
+**The root cause**: V1's W_K-variance heuristic assumes "flat layers are
+safe to quantize aggressively." True on Mistral (TQ2_0 only +25%). False
+on Qwen3-8B where TQ2_0 is catastrophic. V1 doesn't know the downstream
+cost of its downgrades.
+
+### Why V1 = TQ2_0 on Qwen 3.5-9B (hybrid architecture)
+
+V1 on Qwen 3.5-9B produced:
+
+```
+outlier K policy: head_dim=256 metric=0 threshold=2.00
+outlier K spectrum: max/med=2.06x (mean 1.74x) → skew LOW
+outlier K auto-detect summary: 0%=8 layers, 12.5%=0, 25%=0, 50%=0
+```
+
+All 8 attention layers classified as flat. No `adaptive K-cache types:`
+line (has_mixed=false). V1 produces uniform TQ2_0 assignment. V1 PPL =
+TQ2_0 PPL = 7.3239 exactly. Not harmful, not helpful.
+
+**This is actually a success case** — V1 correctly recognized there's
+nothing to protect and degenerated to the simplest policy. Users who
+need 6.4× compression on Qwen 3.5-9B can just use `-ctk tq2_0` directly.
+
+### The Qwen 3.5-9B finding (bonus)
+
+Qwen 3.5-9B has the **best TQ2 behavior in the entire test suite**:
+
+- TQ2_0 PPL delta: **+2.57%** (vs Mistral's +25%, Qwen3-8B's +117%,
+  Llama 3-8B's +72%)
+- K-cache: **5.00 MiB** (vs F16's 32 MiB) — 6.4× compression
+- V cache: 32 MiB (F16)
+
+Why so good? **Hybrid Mamba+attention**: only 8 of 36 layers have KV
+cache. The other 28 are Mamba state-space blocks that don't depend on
+KV quantization at all. Only ~22% of the forward pass is affected by
+K-cache precision. Even uniform TQ2_0 is a rounding error on the whole
+model's quality.
+
+**Deployment implication**: Qwen 3.5-9B is the single best model for
+aggressive KV compression in the entire Aulora stack. Use `-ctk tq2_0`
+directly — skip V1, skip the tuning guide, it's just free.
+
+Separately confirmed: **CUDA is the only GPU backend that handles
+Qwen 3.5-9B**. Metal crashes at `GGML_ASSERT(ne10 == ne02)` for
+head_dim=256 hybrid attention. CPU works via AVX2 IQK.
+
+### Updated V1 recommendation (ship-ready)
+
+**Do NOT default to V1 adaptive.** Instead:
+
+1. **Default (any architecture)**: `-ctk tq3_0 -ctv tq3_0`. Near-lossless
+   on every model tested, 4.6× compression. Works on Mistral, Qwen3-8B,
+   Gemma 3-4B, Llama 3-8B, and Qwen 3.5-9B.
+
+2. **Memory-constrained long context**: `-ctk tq2_1 -ctv f16`. 5.8× K
+   compression, acceptable on all non-Llama modern architectures.
+
+3. **Maximum compression on Qwen 3.5 hybrid**: `-ctk tq2_0 -ctv f16`.
+   Essentially free at +2.6% PPL.
+
+4. **V1 adaptive (`--kv-outlier-frac -1`) is OPT-IN** for Mistral-class
+   clean dense models where users have validated it matches or beats
+   uniform TQ2_1 on their specific workload. **It is not a safe default.**
+
+5. **Rank-deficient models (Q dim < head dim)**: auto-downgrade to TQ4_0
+   kicks in automatically. No user action needed. Confirmed on Qwen3-4B
+   across all three backends.
+
+### Phase 3.5 retrospective
+
+What was correct:
+- V1 on Mistral is a genuine Pareto improvement (tied quality, less memory)
+- The head_dim-aware default infrastructure is solid
+- Env var override mechanism works and lets power users tune
+- Spectrum skew diagnostic helps users understand the W_K shape
+- Rank-deficient auto-downgrade protects users from the Qwen3-4B failure mode
+
+What was wrong:
+- **"V1 is strictly better than TQ2_1" was an overgeneralization** from
+  Mistral-only 160-chunk testing
+- **Spectrum skew is NOT a reliable predictor of V1 effectiveness** —
+  both Mistral (works) and Llama (fails) show LOW skew
+- **W_K variance is not a reliable predictor of quantization sensitivity**
+  on all architectures — the Llama family breaks the assumption
+
+What we learned:
+- Different model families need different KV quantization strategies
+- Static weight analysis has blind spots; some sensitivity is only
+  visible at inference time
+- The "one adaptive policy for all models" dream is not achievable with
+  W_K variance alone
+
+The V1 adaptive mechanism is **correct in its implementation** — it does
+what the design says it should do. The issue is that the **design's
+underlying assumption** (flat W_K ⇒ safe TQ2_0 downgrade) doesn't hold
+universally. That's a research problem, not an engineering bug.
 
 ---
 

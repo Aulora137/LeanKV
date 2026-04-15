@@ -1807,50 +1807,32 @@ Commit: `114437b9` (`feature/tq2-outlier-tiered` branch).
 
 ## 18. V1 Adaptive Policy + head_dim-Aware Defaults (Phase 3.5)
 
-**Date:** 2026-04-13
-**Hardware:** AMD Ryzen 7 7735U, AVX2, 8 threads
-**Software:** Lean_llama.cpp commit `6c121095`
-**Goal:** Retune the adaptive K-cache policy so that it delivers a strict
-Pareto improvement over uniform TQ2_1 on head_dim=128 dense models, and ship
-safe defaults for all head_dim regimes.
+**Date:** 2026-04-13 — 2026-04-15
+**Status:** Shipped but with important limits uncovered during cross-backend validation
+**Software:** Lean_llama.cpp commit `6c121095` (V1 policy) + `f27129c0` (CUDA fix)
 
-### 18.1 The Phase 1 problem
+### 18.1 Goal
 
-Section 17 documented the initial per-layer auto-detect diagnostic with a
-2× median threshold. On Mistral 7B at 160 chunks it produced only a 0.082
-PPL improvement over uniform TQ2_0 (about 18% of the TQ2_0→TQ2_1 quality
-gap), which is functionally identical to TQ2_0 within stderr. **The policy
-was working mechanically but the threshold was too strict** — only 5 of
-32 layers got promoted.
+Retune the Phase 1 per-layer auto-detect diagnostic (Section 17) into an
+actually-shipping adaptive K-cache selection policy. The original 2.0× median
+threshold produced only +0.082 PPL improvement over uniform TQ2_0 on Mistral 7B
+— a mechanical success but essentially no quality win.
 
-### 18.2 Trial-and-error threshold screening
+### 18.2 Threshold trial-and-error screening
 
-Added runtime-switchable policies via two environment variables:
+Runtime-switchable policies via two environment variables:
 
 ```
 LEANKV_OUTLIER_METRIC     — 0=n_moderate, 1=max_ratio, 2=total_variance, 3=hybrid
 LEANKV_OUTLIER_THRESHOLD  — metric-specific float threshold
 ```
 
-Tested 7 variants at 3 chunks on Mistral 7B:
+Screening on Mistral 7B (3-chunk) across 7 variants produced **V1 (n_moderate
+at 1.5× median threshold)** as the clear winner — it assigns 11 layers TQ2_0,
+19 layers TQ2_1, and 2 layers TQ3_0 based on each layer's W_K variance
+signature.
 
-| Variant | Metric | Threshold | K-cache | PPL (3-chunk) | Layer split |
-|---------|--------|----------:|--------:|--------------:|-------------|
-| V0 default | n_moderate | 2.0× | 20.31 | 8.05 | 27+5+0 |
-| **V1** | **n_moderate** | **1.5×** | **21.69** | **7.56** | **11+19+2** |
-| V2 | n_moderate | 1.2× | 25.38 | 6.85 | 0+14+18(TQ3) |
-| V3 | n_moderate | 1.1× | 27.62 | 6.60 | 0+2+30(TQ3) |
-| V4 | total_var | 1.1× | 20.81 | 7.73 | 19+13+0 |
-| V5 | total_var | 1.0× | 20.94 | 7.68 | 17+15+0 |
-| V6 | max_ratio | 2.5× | 20.06 | 7.94 | 31+1+0 |
-| V7 | hybrid | 2.5× | 20.06 | 7.94 | 31+1+0 |
-
-V1 emerged as the clear winner: at 1.5× threshold on the n_moderate metric,
-the policy assigns **11×TQ2_0 + 19×TQ2_1 + 2×TQ3_0**. The 2 TQ3_0 layers
-are the key — they spend extra bits where it matters while the 11 TQ2_0
-layers save bits where it doesn't.
-
-### 18.3 V1 Full 160-Chunk Validation (Mistral 7B)
+### 18.3 V1 on Mistral 7B — full 160-chunk validation (CPU)
 
 | Config | K-cache | PPL | Stderr | Delta vs F16 | vs TQ2_1 |
 |--------|--------:|----:|-------:|-------------:|---------:|
@@ -1860,54 +1842,83 @@ layers save bits where it doesn't.
 | **V1 adaptive (1.5×)** | **21.69** | **5.9940** | **±0.033** | **+0.831** | **+0.016** |
 | TQ2_1 uniform | 22.00 | 5.9784 | ±0.033 | +0.816 | 0 |
 
-**Statistical significance (160 chunks):**
+**V1 vs TQ2_1 on Mistral**: delta 0.016 PPL, combined stderr 0.047 → **0.34σ**
+(statistically tied). V1 delivers **uniform-TQ2_1 quality at 1.5% less memory**
+— a strict Pareto improvement on this model.
 
-- V1 vs TQ2_1: delta 0.016, combined stderr 0.047 → **0.34σ** (p ≈ 0.73, tied)
-- V1 vs TQ2_0: delta 0.429, combined stderr 0.049 → **8.8σ** (dramatic)
-- V1 vs V0: delta 0.347, combined stderr 0.050 → **7.1σ** (dramatic)
+### 18.4 Cross-model V1 scorecard (Phase 5 CUDA batch, 2026-04-15)
 
-**Result**: V1 **statistically ties uniform TQ2_1 at 1.5% less memory** —
-the first strict Pareto improvement on the TQ2_1 quality tier.
+**The critical finding from the cross-architecture CUDA validation**: V1's
+Mistral win does NOT generalize. On models where uniform TQ2_0 is unsafe,
+V1's per-layer downgrades actively harm quality.
 
-### 18.4 Cross-Architecture Screening (3 chunks)
+| Model | head_dim | V1 | TQ2_1 | TQ2_0 | V1 vs TQ2_1 | Verdict |
+|-------|---------:|---:|------:|------:|------------:|:-------:|
+| **Mistral 7B** (dense) | 128 | 6.005 | 5.973 | 6.461 | **+0.032 (tied)** | ✅ Useful |
+| **Qwen3-8B** (dense) | 128 | 16.48 | 13.72 | 18.66 | **+2.77 (WORSE)** | ❌ Harmful |
+| **Gemma 3-4B** (dense) | 256 | 14.39 | 14.00 | 14.68 | +0.39 (slightly worse) | ➖ Neutral |
+| **Llama 3-8B** (dense) | 128 | 12.25 | 10.00 | 12.71 | **+2.25 (WORSE)** | ❌ Harmful |
+| **Qwen3-4B** (rank-deficient) | 128 | (forced TQ4) | (forced TQ4) | (forced TQ4) | — | ✅ Auto-downgrade protects |
+| **Qwen 3.5-9B** (hybrid) | 256 | 7.324 | 7.221 | 7.324 | +0.10 (= TQ2_0) | ➖ No-op |
 
-| Model | head_dim | TQ2_0 PPL | V1 PPL | TQ2_1 PPL | V1 K-cache | V1 verdict |
-|-------|---------:|----------:|-------:|----------:|-----------:|------------|
-| Mistral 7B | 128 | 8.15 | **7.56** | 7.56 | 21.69 | **Win** |
-| Qwen 3.5-9B | 256 | 8.12 | 8.09 | 8.04 | 5.12 | Neutral (mostly flat) |
-| Gemma 3-4B | 256 | 19.33 | 18.96 | **18.57** | 23.56 | Slightly Pareto-worse |
-| Qwen 2.5-0.5B | 64 | 4132 | 2740 | (broken) | 2.09 | All TQ2 hopeless |
+**V1 is beneficial on 1 of 6 tested models** (Mistral), neutral on 3, and
+**actively harmful on 2** (Qwen3-8B, Llama 3-8B). The previous claim that
+V1 is "strictly better than TQ2_1" was an overgeneralization from Mistral-only
+testing.
 
-**Findings:**
+### 18.5 Why V1 fails on Qwen3-8B and Llama 3-8B
 
-1. **head_dim=128 dense**: V1 at 1.5× is clearly the right threshold.
-2. **head_dim=256 dense**: 2.0× is safer (Gemma regression at 1.5× due to
-   over-aggressive TQ3_0 promotions adding memory cost).
-3. **head_dim=256 hybrid**: V1 barely promotes anything (Qwen 3.5's W_K is
-   already flat). Functionally equivalent to uniform TQ2_0.
-4. **head_dim=64**: Heavy-tailed post-rotation distribution destroys TQ2
-   at any threshold. Only TQ3+ is viable.
+**The mechanism**: V1 analyzes W_K row variance and downgrades "flat" layers
+to TQ2_0. For Mistral, those downgrades are safe because TQ2_0 only degrades
+by +25% on this model. The downgrade tax is small.
 
-### 18.5 Shipped Defaults (Production)
+**On Qwen3-8B**, TQ2_0 degrades by **+117%**. When V1 downgrades 11 layers from
+TQ2_1 to TQ2_0, those 11 layers compound enough error to make the full model
+worse than uniform TQ2_1. Per-layer histogram: `0%=11 layers, 12.5%=10, 25%=15`.
+V1 assigns `tq2_0=11, tq2_1=25` — the 11 TQ2_0 layers are the problem.
 
-Based on the cross-arch screening, Phase 3.5 ships head_dim-dependent
-defaults:
+**On Llama 3-8B**, the failure is even more extreme. Llama's W_K is almost
+completely flat (spectrum max/median = 2.78×, skew LOW), so V1 classifies
+**30 of 32 layers as "flat"** and downgrades them all to TQ2_0. The result:
+`tq2_0=30, tq2_1=2`. V1 produces near-uniform-TQ2_0 behavior (+65% PPL) when
+uniform TQ2_1 would have been +35%. The "Llama mystery" from Phase 3.5 — flat
+W_K but severe TQ quantization sensitivity — is now confirmed on CUDA gold
+standard.
+
+**The root cause**: V1's W_K variance heuristic assumes "flat layers are safe
+to quantize aggressively." This is **true for Mistral but demonstrably false
+for Llama 3 and Qwen3-8B**. The sensitivity on those models lives in a
+mechanism V1 doesn't measure — possibly attention head rotation, training
+dynamics, or architectural quirks that don't show up in static weight
+analysis.
+
+### 18.6 Shipped defaults (head_dim-aware)
+
+Phase 3.5 ships head_dim-dependent thresholds with env var overrides for
+tuning:
 
 | head_dim | Threshold | Behavior | Reason |
 |---------:|----------:|----------|--------|
-| ≤ 96 | **disabled** | Uniform type_k, warning on HIGH skew | TQ2 broken at low d |
-| 97 – 128 | **1.5×** | Adaptive V1 | Mistral/Llama sweet spot |
-| 129 – 256 | **2.0×** | Adaptive V0 (conservative) | Gemma/Qwen 3.5 safe |
-| ≥ 257 | **disabled** | Uniform type_k | Hadamard does all the work |
+| ≤ 96 | disabled | Uniform type_k, warning on HIGH skew | TQ2 broken at low d |
+| 97 – 128 | 1.5× | V1 adaptive | Mistral/Llama sweet spot (mechanically) |
+| 129 – 256 | 2.0× | V0 adaptive (conservative) | Gemma/Qwen 3.5 safe |
+| ≥ 257 | disabled | Uniform type_k | Hadamard does all the work |
 
-These defaults apply automatically when `--kv-outlier-frac -1` is set.
-Users who want to tune can override with env vars.
+**But with the Phase 5 finding**, the honest recommendation is:
 
-### 18.6 Spectrum Skew Diagnostic
+- **For Mistral-class "clean" models**: V1 at 1.5× is optional — tied with
+  uniform TQ2_1 at slightly less memory. Pareto win.
+- **For Qwen3-class TQ2-sensitive models**: **use uniform TQ2_1**, not V1.
+- **For Llama-class flat-but-sensitive models**: **use uniform TQ2_1 or TQ3**,
+  not V1. The auto-detect cannot predict Llama's sensitivity.
+- **For Gemma-class head_dim=256 dense**: use uniform TQ3 (improves PPL!) or
+  TQ2_1 if memory-bound. V1 is a mild Pareto loss.
+- **For Qwen 3.5 hybrid**: use uniform TQ2_0 directly. Hybrid Mamba+attention
+  has so few KV-dependent layers that V1's analysis produces the same result.
 
-At model load, LeanKV now logs a one-line summary of the W_K variance
-distribution shape to help users know whether they're in safe default
-territory:
+### 18.7 Spectrum skew diagnostic
+
+Every `--kv-outlier-frac -1` load now logs a one-line summary:
 
 ```
 outlier K spectrum: max/med=2.66x (mean 1.83x) → skew LOW (nearly flat)
@@ -1915,212 +1926,265 @@ outlier K spectrum: max/med=4.63x (mean 3.04x) → skew MODERATE (typical)
 outlier K spectrum: max/med=17.24x (mean 3.60x) → skew HIGH (validate PPL)
 ```
 
-Classification:
-- **LOW** (max/median < 3×): distribution is nearly flat, any reasonable
-  policy is safe
-- **MODERATE** (3× ≤ max/median < 10×): typical dense transformer,
-  default policy should work
-- **HIGH** (max/median ≥ 10×): heavy-tailed, recommend `llama-perplexity`
-  validation before production deployment
+**Important caveat**: spectrum skew is **not a reliable predictor of V1
+effectiveness**. Both Mistral (LOW, V1 works) and Llama 3-8B (LOW, V1 fails)
+showed the same LOW label. The skew measures W_K distribution shape only;
+it cannot predict model sensitivity to quantization.
 
-### 18.7 Tuning Guide
+### 18.8 Tuning guide
 
-**For standard use**: just set `--kv-outlier-frac -1`. The head_dim-based
-default picks the right threshold automatically. Ship TQ2_1 memory savings
-with TQ2_1-tied quality on head_dim=128 models.
+**Standard use** (CPU, any architecture):
+1. Start with `-ctk tq3_0 -ctv tq3_0` — near-lossless, 4.6× compression
+2. If more memory needed: try `-ctk tq2_1 -ctv f16` uniform
+3. **Do not trust V1 adaptive without PPL validation on your model**
 
-**For tinkering**: override via environment variables before launching:
+**Power user tuning** via environment variables:
 
 ```bash
-# Try a different threshold (e.g., 1.3× for even more aggressive promotion)
-LEANKV_OUTLIER_THRESHOLD=1.3 \
+# Override threshold (default = head_dim-dependent)
+LEANKV_OUTLIER_METRIC=0 LEANKV_OUTLIER_THRESHOLD=1.3 \
     llama-cli -m model.gguf -ctk tq2_0 --kv-outlier-frac -1 ...
 
-# Switch to total-variance metric
+# Try total-variance metric (alternate predictor)
 LEANKV_OUTLIER_METRIC=2 LEANKV_OUTLIER_THRESHOLD=1.1 \
     llama-cli -m model.gguf -ctk tq2_0 --kv-outlier-frac -1 ...
 ```
 
-**Recommended tuning procedure** for a new model family:
+### 18.9 Known limits
 
-1. Load the model and check the skew label in the init log
-2. If LOW or MODERATE: default should work, validate with `llama-perplexity --chunks 3` to confirm output is coherent
-3. If HIGH: full 160-chunk PPL validation is recommended — try thresholds {1.2, 1.5, 1.8, 2.0, 2.5} and pick the best PPL at acceptable memory
-4. If you find a better threshold than the default, document it for your model and use the env var override
+**Architectures where V1 auto-detect is unreliable**:
+- **Llama family** — flat W_K across all layers yet TQ2-sensitive. Mechanism
+  unknown. Use uniform TQ2_1 or higher.
+- **Qwen3-8B dense** — elevated variance on some layers but TQ2_0 is
+  catastrophic (+117%). V1's downgrades compound the damage.
+- **head_dim=256 dense (Gemma-class)** — Hadamard concentration already
+  handles most of the work. V1 promotions cost more than they save.
 
-### 18.8 Known Limits
+**Rank-deficient models** (Q dim < head dim): auto-downgraded to TQ4_0 at load
+time. Adaptive is bypassed. Confirmed working on Qwen3-4B across CPU + Metal +
+CUDA — safety net is validated.
 
-**Models where adaptive is disabled automatically:**
+**The Llama mystery remains open.** The most important unresolved question
+from this project: what IS the mechanism that causes Llama 3 models to show
+elevated TQ quantization sensitivity despite having flat W_K variance? Future
+work flag:
+1. Test W_Q variance instead of W_K
+2. Instrument post-Hadamard runtime variance during inference
+3. Per-channel quantization error injection to directly measure sensitivity
 
-- **head_dim ≤ 96** (Qwen 2.5-0.5B and similar tiny models): Hadamard
-  concentration is too weak to produce a Gaussian-like post-rotation
-  distribution. Residual outliers overwhelm any 4-level codebook. Uniform
-  TQ3_0 or TQ4_0 is the only viable aggressive compression.
-- **head_dim ≥ 512** (theoretical, no current models): Hadamard already
-  produces a near-perfect Gaussian. Adaptive detection finds noise rather
-  than signal. Uniform TQ2_0 is optimal.
-
-**Models where adaptive is active but caveats apply:**
-
-- **Llama 3 family** (3B/8B, head_dim=128): W_K variance is flat across
-  all layers, yet Llama shows elevated TQ3 sensitivity in Phase 2b results.
-  The sensitivity is not caused by per-channel outliers (the signal V1
-  uses), so V1 provides minimal benefit on Llama. Cause is unknown —
-  possibly attention-head rotational invariance. For Llama, use TQ3_0
-  directly if TQ2 quality isn't acceptable.
-- **Rank-deficient Q/KV models** (Qwen3-4B with `n_embd/n_head < head_dim`):
-  auto-downgraded to TQ4_0 at load time. Adaptive is irrelevant.
-- **head_dim=256 dense with heavy middle layers** (Gemma 3-4B, Qwen3-8B):
-  the 2.0× default is safer than 1.5× because the conservative threshold
-  avoids over-aggressive TQ3_0 promotions that cost more memory than they
-  save in quality.
-
-**The Llama mystery**: the most important open question. Llama 3.2-3B and
-Llama 3-8B both show completely flat W_K variance (all layers at 0%
-outliers even at 1.5× threshold), yet they're the most TQ3-sensitive
-modern dense architecture. Future work should investigate:
-
-1. **W_Q variance instead of W_K** — maybe Q-side outliers dominate
-2. **Post-Hadamard runtime variance** — instrument actual KV values during
-   the first N tokens of inference
-3. **Quantization error injection** — directly measure per-channel
-   sensitivity by adding synthetic noise
-
-### 18.9 Files and Commits
-
-**Lean_llama.cpp** (commit `6c121095`):
+### 18.10 Files and commits
 
 | File | Change |
 |------|--------|
-| `ggml/src/ggml-tq-outlier.h` | Added `tq_auto_detect_outlier_frac_ex()` with metric/threshold parameters |
+| `ggml/src/ggml-tq-outlier.h` | `tq_auto_detect_outlier_frac_ex()` with metric/threshold params |
 | `ggml/src/ggml-tq-outlier.c` | 4-way metric dispatch (n_moderate / max_ratio / total_var / hybrid) |
 | `src/llama.cpp` | Two-pass loop + head_dim-dependent default + spectrum skew log |
 
-**Screening artifacts** committed for reproducibility:
-- `docs/adaptive-mistral-overnight.sh` — 160-chunk 4-config validation script
-- `docs/adaptive-mistral-results.txt` — full V1 160-chunk raw output
-- `docs/outlier-threshold-screen.sh` — 7-variant screening script
-- `docs/outlier-threshold-screen.txt` — screening raw output
-- `docs/outlier-finalist-160chunk.txt` — V1 + V4 finalist 160-chunk output
-- `docs/v1-cross-arch-screen.sh` — cross-architecture screening
-- `docs/v1-cross-arch-screen.txt` — cross-arch raw output
-
-### 18.10 What's Deferred to Future Sessions
-
-**Fingerprint cache** (opt-in `--kv-tune-threshold` flag): would enable
-first-run auto-tuning that writes results to `~/.cache/leankv/fingerprints.json`
-keyed by a model fingerprint. Subsequent loads of the same model read the
-cached threshold instantly. Useful for users who want to validate a new
-model family once and reuse the result across many runs. Deferred because
-it requires careful design of the calibration protocol and cache storage
-format — not blocking the current V1 ship.
+Key commits: `114437b9` (Phase 1 diagnostic) → `6c121095` (Phase 3.5 V1 ship) →
+`f27129c0` (CUDA compile fix).
 
 ---
 
-## 19. GPU Backend Results — Metal and CUDA
+## 19. GPU Backend Results — Cross-Platform Validation (Metal + CUDA)
 
-Both GPU backends are now fully implemented and validated for all TQ types
-(TQ4_0, TQ3_0, TQ2_0, TQ2_1) including Flash Attention. Detailed results
-are in dedicated documents; this section summarizes the key findings.
+**Date:** 2026-04-13 (Metal) — 2026-04-15 (CUDA)
+**Summary:** Complete cross-backend validation across CPU (Ryzen AVX2),
+Metal (Apple M2), and CUDA (NVIDIA RTX 4090). All three backends produce
+consistent PPL (±0.05) on identical workloads for the models they can run.
 
-### 19.1 Metal (Apple Silicon M2) — Summary
+**Full details:** [`CUDA-RESULTS.md`](CUDA-RESULTS.md),
+[`TQ2-METAL-RESULTS.md`](TQ2-METAL-RESULTS.md)
 
-**Full results:** [`TQ2-METAL-RESULTS.md`](TQ2-METAL-RESULTS.md)
+### 19.1 Metal validation — clean cross-check (Mistral 7B, 160 chunks)
 
-**Validation:** 160-chunk WikiText-2 on Mistral 7B, Metal vs CPU (Ryzen 7 AVX2).
-All configs matched within **±0.02 PPL** — Metal is numerically identical to CPU.
+| Config | CPU (Ryzen) | **Metal (M2)** | Delta | Status |
+|--------|------------:|---------------:|------:|:------:|
+| F16/F16 | 5.1627 ± 0.029 | **5.1678 ± 0.029** | +0.005 | PASS |
+| TQ2_1 uniform | 5.9784 ± 0.033 | **5.9883 ± 0.033** | +0.010 | PASS |
+| V1 adaptive | 5.9940 ± 0.033 | **6.0135 ± 0.033** | +0.020 | PASS |
+| TQ2_0 uniform | 6.4229 ± 0.036 | **6.4120 ± 0.036** | −0.011 | PASS |
 
-| Config | CPU PPL (160ch) | Metal PPL (160ch) | Delta | KV size (2048 ctx) |
-|--------|-----------:|-----------:|------:|-------------------:|
-| F16 | 5.163 | 5.168 | +0.005 | 256 MiB |
-| TQ2_1 (2.75 bpe) | 5.978 | 5.988 | +0.010 | 44 MiB |
-| V1 adaptive (~2.65 bpe) | 5.994 | 6.014 | +0.020 | 43 MiB |
-| TQ2_0 (2.5 bpe) | 6.423 | 6.412 | -0.011 | 40 MiB |
+All configs within ±0.02 PPL — well under the ±0.1 pass threshold. V1
+produced identical layer distribution on Metal (`11×TQ2_0 + 19×TQ2_1 +
+2×TQ3_0`) as on CPU. Phase 3 adaptive type selection is validated on
+Apple Silicon.
 
-**Speed:** All TQ types decode at ~55-65% of F16 speed on M2. The bottleneck is
-dequant dispatch overhead, not bit-width — TQ2_0 and TQ4_0 run at the same speed.
+**Metal limitation**: Qwen 3.5-9B triggers `GGML_ASSERT(ne10 == ne02)` in
+`ggml-metal.m:3425` — even F16 baseline fails. This is a pre-existing
+Metal FA compatibility issue with head_dim=256 hybrid attention. Workaround:
+use CPU (`-ngl 0`) or CUDA for this specific model.
 
-**Multi-model coverage:** 5 models tested (Mistral 7B, Qwen3-8B, Qwen3-4B,
-Gemma 3-4B, Llama 3-8B). Key finding: Q→KV dimensional ratio predicts quantization
-tolerance. Models with ratio < 1.0 (Qwen3-4B) degrade catastrophically below TQ4.
+### 19.2 CUDA implementation (RTX 4090)
 
-### 19.2 CUDA (NVIDIA RTX 4090) — Summary
+**Total wall time**: 39 minutes for 36 configs × 160 chunks on RTX 4090
+(32 min for the 5-model batch + 7 min for supplemental Qwen 3.5-9B).
 
-**Full results:** [`CUDA-RESULTS.md`](CUDA-RESULTS.md)
+**Implementation**: Custom `vec_dot_fattn_vec_KQ` CUDA kernels for all four
+TQ types using DP4A int8 dot products with codebook lookup. Reduced
+graph splits from 66 → 2. See CUDA-RESULTS.md for the implementation
+architecture.
 
-**Implementation:** Custom `vec_dot_fattn_vec_KQ` kernels for all 4 TQ types using
-DP4A int8 dot products with codebook lookup. Eliminated 66→2 graph splits.
+**Build fix**: The initial CUDA build added TQ dispatch lines to
+`fattn-common.cuh`'s dead-code copy of `get_vec_dot_KQ_*` functions,
+breaking compilation in non-vec FA units. Fix: removed the dead-code
+references (commit `f27129c0`). The real dispatch in
+`fattn-vec-common.cuh` was already correct.
 
-**Validation:** 3-chunk TinyShakespeare on Mistral 7B. All configs produce correct
-output with 2 graph splits. Note: 3-chunk PPL on TinyShakespeare gives inflated
-delta percentages vs the 160-chunk WikiText-2 gold standard — see CUDA-RESULTS.md
-Section 6 for the full explanation.
+### 19.3 Full CUDA batch results (160 chunks WikiText-2)
 
-| Config | CUDA PPL (3ch, TinyShksp) | 160ch gold std PPL | KV size (2048 ctx) |
-|--------|--------------------------:|-------------------:|-------------------:|
-| F16 | 8.635 | 5.168 | 256 MiB |
-| TQ4_0 (4.5 bpe) | 8.716 | — (pending ‡) | 72 MiB |
-| TQ3_0 (3.5 bpe) | 9.159 | — (pending ‡) | 56 MiB |
-| TQ2_1 (2.75 bpe) | 12.223 | 5.988 | 44 MiB |
-| TQ2_0 (2.5 bpe) | 14.986 | 6.412 | 40 MiB |
+**Mistral 7B** (head_dim=128 dense, hero model):
 
-‡ TQ4/TQ3 160-chunk runs pending. Estimates from 3-chunk ratios: ~+1% and ~+3%.
+| Config | K-cache | PPL | Delta % | vs TQ2_1 |
+|--------|--------:|----:|--------:|---------:|
+| F16 | 128.00 MiB | 5.1638 | — | — |
+| TQ4_0 | 36.00 MiB | 5.1781 | +0.28% | — |
+| TQ3_0 | 28.00 MiB | 5.2464 | +1.60% | — |
+| TQ2_1 | 22.00 MiB | 5.9726 | +15.66% | 0 |
+| V1 adaptive | 21.69 MiB | 6.0048 | +16.28% | +0.62% |
+| TQ2_0 | 20.00 MiB | 6.4612 | +25.12% | +9.46% |
 
-**Speed:** Prompt eval at 94% of F16 throughput (7459 vs 7910 t/s for TQ4). Decode
-~136-165 t/s across all types. RTX 4090's compute surplus makes TQ dequant overhead
-nearly invisible — far better than Metal's 55-65%.
+**Qwen3-8B** (head_dim=128 dense, 146 chunks):
 
-### 19.3 Cross-Backend Quality: What Matters
+| Config | K-cache | PPL | Delta % | vs TQ2_1 |
+|--------|--------:|----:|--------:|---------:|
+| F16 | 144.00 MiB | 8.6097 | — | — |
+| TQ4_0 | 40.50 MiB | 8.7932 | +2.13% | — |
+| TQ3_0 | 31.50 MiB | 8.8888 | +3.24% | — |
+| TQ2_1 | 24.75 MiB | 13.7150 | +59.29% | 0 |
+| V1 adaptive | 24.06 MiB | 16.4815 | +91.43% | **+32.13%** |
+| TQ2_0 | 22.50 MiB | 18.6630 | +116.76% | +57.46% |
 
-**All three backends (CPU, Metal, CUDA) produce the same quality.** The numerical
-results are identical within ±0.02 PPL when tested on the same dataset. Apparent
-differences in delta percentages between Metal 3-chunk and CUDA 3-chunk results
-(e.g., TQ2_1 showing +65% on Metal vs +41.5% on CUDA) are dataset artifacts, not
-real backend differences. Always use the 160-chunk numbers for quality assessment.
+**V1 is significantly WORSE than uniform TQ2_1 on Qwen3-8B** — the 11
+downgraded-to-TQ2_0 layers compound TQ2_0's +117% sensitivity.
 
-### 19.4 TQ2 Practical Usability
+**Gemma 3-4B** (head_dim=256 dense, 144 chunks):
 
-The real question for TQ2 types is not "what is the PPL number?" but "can users
-tell the difference in generated text?"
+| Config | K-cache | PPL | Delta % | Note |
+|--------|--------:|----:|--------:|------|
+| F16 | 136.00 MiB | 12.5221 | — | — |
+| TQ4_0 | 38.25 MiB | 12.3760 | **−1.17%** | **improves!** |
+| TQ3_0 | 29.75 MiB | 12.3214 | **−1.60%** | **improves further!** |
+| TQ2_1 | 23.38 MiB | 13.9998 | +11.80% | — |
+| V1 adaptive | 22.44 MiB | 14.3880 | +14.90% | Pareto-worse than TQ2_1 |
+| TQ2_0 | 21.25 MiB | 14.6811 | +17.24% | — |
 
-**TQ2_1 (2.75 bpe, +16% PPL, 5.8x compression):**
-- Factual Q&A: correct across all models and backends tested
-- Instruction following: correct — no degradation observed
-- Generation coherence: indistinguishable from F16 in casual evaluation
-- Recommended for: long-context deployments (32k+) where KV memory is the bottleneck
+**Gemma confirms "TQ-loves-regularization"**: TQ4 and TQ3 actually improve
+PPL vs F16 baseline. The Hadamard rotation acts as regularization. This is
+the strongest candidate in the suite for TQ3 as default.
 
-**TQ2_0 (2.5 bpe, +24% PPL, 6.4x compression):**
-- Robust models (Mistral 7B, Llama 3-8B): still correct, coherent output
-- Sensitive models (Qwen3-8B): degraded — echoed instructions instead of answering
-- The 0.25 bpe gap from TQ2_1 is meaningful — TQ2_1's mixed precision (32 channels
-  at TQ3 + 96 at TQ2) rescues the critical signal that uniform TQ2_0 loses
-- Recommended for: maximum compression in tolerant applications (summarization, search)
+**Llama 3-8B** (head_dim=128 dense, 141 chunks):
 
-**TQ4_0 and TQ3_0 remain the production defaults.** TQ4 is effectively lossless
-(< +1% PPL). TQ3 is near-lossless (+3% PPL) at 4.6x compression. TQ2 types are
-for users who need to push beyond 4.6x and understand the trade-off.
+| Config | K-cache | PPL | Delta % | V1 distribution |
+|--------|--------:|----:|--------:|-----------------|
+| F16 | 128.00 MiB | 7.4059 | — | — |
+| TQ4_0 | 36.00 MiB | 7.4197 | +0.19% | — |
+| TQ3_0 | 28.00 MiB | 7.5526 | +1.98% | — |
+| TQ2_1 | 22.00 MiB | 10.0031 | +35.08% | — |
+| **V1 adaptive** | 20.12 MiB | **12.2528** | **+65.44%** | **`30×TQ2_0 + 2×TQ2_1`** |
+| TQ2_0 | 20.00 MiB | 12.7085 | +71.58% | — |
 
-### 19.5 Recommended Configuration by Use Case
+**The Llama mystery, confirmed on CUDA**: W_K spectrum is LOW (max/median
+2.78×), so V1 classifies 30 out of 32 layers as flat and downgrades them to
+TQ2_0. V1 ≈ TQ2_0 in quality (+65% vs +72%) but neither is usable. Uniform
+TQ2_1 at +35% is the maximum safe tier for Llama 3-8B.
 
-| Use case | K-cache type | Effective bpe | PPL impact | Compression | Status |
-|----------|-------------|:------------:|:----------:|:-----------:|:------:|
-| Maximum quality | F16 | 16.0 | — | 1.0x | validated |
-| Production default | TQ4_0 | 4.5 | ~+1% | 3.6x | validated |
-| High compression | TQ3_0 | 3.5 | ~+3% | 4.6x | validated |
-| Long context / memory-bound | TQ2_1 | 2.75 | +16% | 5.8x | validated |
-| V1 adaptive | mixed | ~2.65 | +16% | 6.0x | validated |
-| Maximum compression | TQ2_0 | 2.5 | +24% | 6.4x | validated |
+**Qwen3-4B** (head_dim=128 dense, **RANK-DEFICIENT** ratio=0.625, 146 chunks):
 
-PPL impact for TQ2_1/TQ2_0/V1 adaptive from 160-chunk WikiText-2 (Mistral 7B).
-TQ4/TQ3 estimates from consistent 3-chunk ratios — 160-chunk validation pending.
+```
+F16:          12.9359 ± 0.115
+TQ4_0:        12.6261 ± 0.109  (-2.4%, actually improves!)
+TQ3_0:        12.6261  ← forced to TQ4_0 by auto-downgrade
+TQ2_1:        12.6261  ← forced to TQ4_0 by auto-downgrade
+V1 adaptive:  12.6261  ← forced to TQ4_0 by auto-downgrade
+TQ2_0:        12.6261  ← forced to TQ4_0 by auto-downgrade
+```
 
-### 19.6 What's Next
+**Safety net works on CUDA too**. Rank-deficient architecture
+(n_embd/n_head=80 < head_dim=128) triggers the auto-downgrade logic at
+model load. All TQ2/TQ3 requests silently become TQ4_0. The TQ4 result
+improves PPL by 2.4% (Hadamard regularization effect). Without the safety
+net, Phase 2b showed TQ2/TQ2 would produce PPL ~144 on this model.
 
-1. **TQ4_0 + TQ3_0 160-chunk validation** — overnight run on M2 to fill the ‡ gaps
-2. **CUDA 160-chunk validation** — WikiText-2 on RTX 4090 to close the loop
-3. **LongBench evaluation** — test TQ2_1 on long-context tasks (the real target use case)
-4. **Multi-model CUDA benchmarks** — Qwen3-8B, Llama 3-8B, Gemma 3-4B on RTX 4090
-5. **Concurrent inference scaling** — measure actual requests/GPU with TQ compression
+**Qwen 3.5-9B** (head_dim=256 hybrid, 145 chunks — supplemental run):
+
+| Config | K-cache | PPL | Delta % | Note |
+|--------|--------:|----:|--------:|------|
+| F16 | 32.00 MiB | 7.1404 | — | — |
+| TQ4_0 | 9.00 MiB | 7.1453 | **+0.07%** | near-lossless |
+| TQ3_0 | 7.00 MiB | 7.1663 | **+0.36%** | near-lossless |
+| TQ2_1 | 5.50 MiB | 7.2211 | +1.13% | excellent |
+| V1 adaptive | 5.00 MiB | 7.3239 | +2.57% | = TQ2_0 (all layers flat) |
+| TQ2_0 | 5.00 MiB | 7.3239 | +2.57% | **best aggressive target** |
+
+**Qwen 3.5-9B is the best TQ2 target in the entire test suite.** TQ2_0 at
++2.57% PPL — **7× better than Gemma**, **45× better than Qwen3-8B** at
+the same 6.4× compression. Why? Only 8 attention layers out of 36 (rest
+are Mamba state-space). Only ~22% of the forward pass uses KV cache, so
+quantization noise affects a small fraction of compute. The Mamba layers
+bypass KV quantization entirely.
+
+**Deployment implication**: Qwen 3.5-9B is the single best model for
+aggressive KV compression in the Aulora bitcoin node stack. Uniform TQ2_0
+at ~5 MiB K-cache is essentially free.
+
+### 19.4 Cross-backend consistency check (Mistral 7B)
+
+| Config | CPU PPL | Metal PPL | CUDA PPL | Max spread |
+|--------|--------:|----------:|---------:|-----------:|
+| F16 | 5.1627 | 5.1678 | 5.1638 | 0.005 |
+| TQ2_1 | 5.9784 | 5.9883 | 5.9726 | 0.016 |
+| V1 adaptive | 5.9940 | 6.0135 | 6.0048 | 0.020 |
+| TQ2_0 | 6.4229 | 6.4120 | 6.4612 | 0.049 |
+
+**All three backends within ±0.05 PPL.** CPU / Metal / CUDA are numerically
+consistent. Different compute paths (AVX2 IQK, Metal Flash Attention, CUDA
+DP4A), same PPL. Gold standard cross-platform validation achieved.
+
+### 19.5 CUDA-only: Qwen 3.5-9B deployment path
+
+**CUDA is the only GPU backend that handles Qwen 3.5-9B.** Metal crashes
+at the FA assertion check. CPU works but is slow for datacenter serving.
+CUDA works at 94-97% of F16 throughput across all TQ types.
+
+| Backend | Qwen 3.5-9B status |
+|---------|-------------------|
+| CPU (AVX2) | ✅ Works, slow at scale |
+| Metal (M2) | ❌ `GGML_ASSERT(ne10 == ne02)` — even F16 fails |
+| **CUDA (RTX 4090)** | **✅ Full support, 94%+ F16 throughput** |
+
+For the Aulora bitcoin node scaling story: **local inference uses CPU on
+the node itself; remote scaling spills to CUDA GPU rentals**. Metal is
+not a viable serving path for the hero model.
+
+### 19.6 Recommended configurations (final)
+
+**Per-model recommendations based on validated 160-chunk results**:
+
+| Model | Best config | PPL Δ | Compression | Rationale |
+|-------|-------------|------:|:-----------:|-----------|
+| Mistral 7B | TQ3_0 or V1 | +1.6% / +16% | 4.6× / 6.0× | Clean dense, V1 is optional |
+| Qwen3-8B | TQ3_0 | +3.2% | 4.6× | TQ2 sensitive — do not use V1 |
+| Gemma 3-4B | **TQ3_0** | **−1.6% (improves!)** | **4.6×** | **TQ-loves-regularization** |
+| Llama 3-8B | TQ3_0 | +2.0% | 4.6× | TQ2 too sensitive, avoid V1 |
+| Qwen3-4B | TQ4_0 (auto-forced) | −2.4% (improves!) | 3.6× | Rank-deficient safety net |
+| **Qwen 3.5-9B** | **TQ2_0** | **+2.6%** | **6.4×** | **Hybrid attention bypass** |
+
+**Global default** (if you don't know which model): **TQ3_0 uniform K+V**.
+Near-lossless on every architecture tested, 4.6× compression, no adaptive
+policy guessing.
+
+**For memory-constrained long-context** (32K+): **TQ2_1 uniform K, F16 V**.
+5.8× K compression, acceptable quality on all non-Llama modern architectures.
+
+### 19.7 Files
+
+| File | Purpose |
+|------|---------|
+| `docs/cuda-batch-results.txt` | Full raw output from 39-min CUDA batch run |
+| `docs/adaptive-mistral-results.txt` | CPU 160-chunk Mistral baseline |
+| `docs/metal-mistral-results.txt` | Metal M2 160-chunk validation |
+| `ggml/src/ggml-cuda/fattn-common.cuh` | Fixed compile error (dead TQ dispatch removed) |
+| `ggml/src/ggml-cuda/fattn-vec-common.cuh` | TQ vec_dot_KQ kernels (325 lines) |
 
 ---
 
