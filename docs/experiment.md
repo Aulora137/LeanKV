@@ -775,6 +775,277 @@ universally. That's a research problem, not an engineering bug.
 
 ---
 
+## Phase 7: Rank-Aware Quantization via SVD Calibration
+
+**Date:** 2026-04-15
+**Status:** Design (pre-implementation)
+**Target failure case:** Qwen3-4B (rank-deficient Q→KV ratio 0.625)
+**Complements:** Phase 6 (which targets the Llama runtime-variance failure)
+
+### 7.1 Motivation
+
+The Phase 3.5 retrospective identified two unrelated TQ failure modes:
+
+1. **Llama 3-8B**: static W_K analysis is blind to the sensitivity →
+   Phase 6 runtime variance calibration is the proposed fix.
+2. **Qwen3-4B**: the Q→KV dimensional ratio is 0.625, meaning each Q head
+   projects from an 80-dim input into a 128-dim K/V space. The learned KV
+   representations occupy a **rank-80 subspace scattered within the
+   128-dim container**. The other 48 dimensions are structurally unused.
+
+Current workaround for Qwen3-4B: auto-downgrade to TQ4_0 at model load.
+Safe but leaves compression on the table — TQ4 at 3.6× is the best we
+can do on a model that *should* be quantizable to 6×+ if we could work
+in the right basis.
+
+### 7.2 Why Hadamard Breaks Rank-Deficient Models
+
+Hadamard rotation is uniform: `H · K` spreads every value across all 128
+dimensions. For a rank-full model (Mistral 7B, Gemma 3-4B) this is a
+lossless rotation — all 128 dimensions already carry signal, so smearing
+preserves information. Quantization then injects bounded noise uniformly,
+and the regularization bonus (−1% to −2% PPL on some models) can even
+improve quality.
+
+For Qwen3-4B, the pre-Hadamard K vector has ~80 nonzero dimensions and
+~48 near-zero dimensions (scattered in some learned basis). Hadamard
+spreads this so that all 128 dimensions become nonzero. Quantize + inverse
+Hadamard returns approximate signal in the 80 real dims **plus rounding
+noise in the 48 phantom dims**. The model has never trained against
+nonzero values in its unused subspace — attention reads 128 dims and
+sums noise contributions it cannot filter out. Result: random attention
+scores → output collapse (+475% PPL on TQ2_1, +1010% on TQ2_0).
+
+The failure is **not TQ itself** — it is Hadamard being the wrong tool
+for rank-deficient input. Replacing Hadamard with a rank-aware rotation
+should let Qwen3-4B accept aggressive quantization.
+
+### 7.3 Proposed Design
+
+**Core idea:** find each layer's true K-subspace via SVD on real runtime
+K values, rotate into a basis where the subspace is axis-aligned, quantize
+only the used dimensions, restore the unused dims to exact zero on dequant.
+
+**Workflow (per model, run once, cached):**
+
+```
+1. Load model in F16 (no TQ yet)
+2. Run calibration prompt through the model
+   - Diverse corpus: science, narrative, dialog, code, math, lists
+   - ~2000-4000 tokens total
+   - Hook into attention to dump K vectors per layer per head
+3. For each layer L:
+   a. Stack collected K vectors into matrix K_L ∈ R^(N × 128)
+   b. SVD: K_L = U Σ V^T
+   c. Effective rank r_L = smallest r where Σ[:r] captures ≥ 99% of variance
+   d. Rotation R_L = top r_L right singular vectors (ordered)
+   e. Record (R_L, r_L, Σ_L) to cache
+4. Save cache file keyed by model fingerprint hash
+5. Proceed with inference using per-layer policy that applies R_L
+   instead of Hadamard, quantizes r_L dimensions, zero-fills the rest
+```
+
+**Per-layer quantization policy (new format):**
+
+```c
+struct tq_layer_policy {
+    float rotation[128 * 128];   // R_L, learned orthogonal matrix
+    int effective_rank;          // r_L, 40-128
+    int tq_type;                 // TQ4_0 / TQ3_0 / TQ2_1 / TQ2_0
+    int outlier_frac;            // 0 / 12.5% / 25%
+    float reg_bias;              // −1..+1, dial from Metal/CUDA observation
+};
+```
+
+**Cache schema:**
+
+```
+~/.cache/leankv/
+├── <fingerprint>.rotations       # binary per-layer R + r + Σ
+└── fingerprints.json             # {model_hash: cache_path, created_at}
+```
+
+### 7.4 Why This Should Work Mathematically
+
+For a K vector `k` in the rank-r_L subspace:
+- `k_rot = R_L · k` → dims [0..r_L) carry signal, dims [r_L..128) are ≈ 0
+- `k_quant = Q(k_rot[0..r_L))` → quantize only the signal dims
+- `k_recon = [Q^-1(k_quant), 0, 0, ..., 0]` → explicit zeros in unused dims
+- `k_hat = R_L^T · k_recon` → return to original basis
+
+Noise energy is bounded by the quantization noise on `r_L` dims instead of
+128 dims. For Qwen3-4B with r_L=80, this is **37.5% less noise energy**
+than the current Hadamard path, AND no noise is injected into the 48 dims
+the model cannot handle.
+
+For attention: `score = Q · k_hat = Q · R_L^T · k_recon`. Since the unused
+dims of `k_recon` are exactly zero, those contributions are zero. The
+attention score only picks up noise from the rank-80 subspace — which is
+what the model trained against and can handle. **No more phantom noise
+collapse.**
+
+### 7.5 Memory Bookkeeping
+
+Rotation matrix overhead per model:
+- 128×128 fp16 per layer = 32 KiB × 32 layers = **1 MiB per model**
+- Trivial compared to KV cache (tens to hundreds of MiB)
+- One-time cost, stored in cache file
+
+Quantized storage per block with effective_rank = r_L:
+- Only r_L quantized values per block instead of 128
+- For Qwen3-4B at r_L=80: store 80 values instead of 128
+- **+40% memory savings on top of TQ bit-width compression**
+- Combined: TQ3_0 (4.6×) × rank compression (1.6×) = **7.4× vs F16**
+- Or TQ2_1 (5.8×) × rank compression (1.6×) = **9.3× vs F16**
+
+The rank-compression multiplier is free — it comes from not storing
+information the model never uses.
+
+### 7.6 Minimum Viable Experiment
+
+A quick falsification test before committing to the full pipeline:
+
+1. **Dump K vectors from Qwen3-4B** during a calibration run (one layer
+   first, say layer 16 middle of stack). Modify `llm_build_kv_store()`
+   in llama.cpp to tee K values to a file during F16 inference on a
+   2000-token prompt.
+
+2. **SVD in Python**: load dumped K vectors, compute SVD, measure the
+   singular value spectrum. Confirm that ~80 singular values dominate
+   (validates the rank-deficient hypothesis on real data, not just theory).
+
+3. **Prototype quantization**: apply the rotation R, quantize to TQ3, apply
+   inverse rotation. Measure reconstruction MSE vs current Hadamard+TQ3
+   approach on the dumped data. Target: rank-aware MSE < 0.1 × Hadamard MSE.
+
+4. **End-to-end PPL**: if (3) passes, wire it into the TQ copy kernel for
+   Qwen3-4B only (hardcoded rotation matrix for one layer first). Run 3-chunk
+   PPL. Target: bring Qwen3-4B TQ3_0 PPL down from +48% to under +10%.
+
+5. **Full model**: if (4) works, extend to all 32 layers. Run 160-chunk
+   PPL as the proper validation.
+
+**Estimated effort:** 1-2 days for steps 1-4 (falsification), 3-5 days for
+full implementation and validation (step 5+). Much smaller than Phase 6's
+runtime variance design because the mechanism is well-understood — it's
+straight linear algebra, no new quantization format needed.
+
+### 7.7 Success Criteria
+
+| Milestone | Target | Measurable by |
+|-----------|--------|---------------|
+| Subspace validation | Qwen3-4B layer 16 singular values show ≥80% variance in top 80 dims | SVD spectrum plot |
+| Reconstruction quality | Rank-aware MSE < 0.1 × Hadamard+TQ3 MSE | Python prototype |
+| TQ3 PPL on Qwen3-4B | Delta < +10% (vs current +48%) | 3-chunk eval |
+| TQ2_1 PPL on Qwen3-4B | Delta < +25% (vs current +475%) | 3-chunk eval |
+| Full validation | 160-chunk WikiText-2 on Qwen3-4B at TQ3_0 | Overnight run |
+| No regression | Mistral 7B/Gemma 3-4B PPL unchanged when rank-aware path enabled | 160-chunk run |
+| Cache persistence | Second model load uses cached rotations, <100ms overhead | Timed load |
+
+### 7.8 Risks and Open Questions
+
+**1. Calibration corpus sensitivity.**
+Does the rank estimate change meaningfully across calibration corpora? If
+Wikipedia calibration gives r=80 but code calibration gives r=95, which
+is "correct"? Mitigation: measure it. Use multiple corpora during Phase 7
+development and report variance.
+
+**2. Per-head vs per-layer rotations.**
+The design above uses one rotation per layer (across all KV heads). Heads
+might have different effective ranks. Per-head rotations would be more
+accurate but 8× the memory overhead (still small). Decide based on
+measured per-head variance.
+
+**3. Interaction with outlier channels (TQ2_1).**
+TQ2_1's outlier-channel scheme assumes specific channel positions get more
+bits. After rank-aware rotation, "channels" are now rotated dimensions.
+Need to rethink which of the r_L rotated dims get outlier treatment —
+probably the top-variance ones (leading singular values).
+
+**4. Rotation vs Hadamard: do we need both?**
+The learned rotation R already decorrelates; maybe Hadamard on top of that
+is redundant or even counterproductive. Experiment: try (a) R only,
+(b) R then Hadamard on the kept r_L dims, (c) Hadamard only (baseline).
+
+**5. Does Qwen3-4B actually have the claimed rank structure?**
+This is the whole bet. If the K vectors turn out to be effectively
+full-rank (all 128 singular values comparable), then the rank-deficient
+diagnosis was wrong and Phase 7 doesn't help. The MVE step 2 (SVD spectrum
+plot) falsifies or validates this in a few hours.
+
+**6. Cold-start latency.**
+First model load runs calibration (~30s for 4000 tokens through Qwen3-4B
+on M2). Acceptable for batch serving, visible for interactive. Mitigation:
+progressive quantization — serve F16 during calibration, switch to
+rank-aware TQ when ready.
+
+**7. Fingerprint collision.**
+If the cache hash is too coarse, different finetunes of the same base
+model share a cache file. Use SHA256 over GGUF header + tensor sample
+to avoid this.
+
+### 7.9 Relationship to Other Phases
+
+| Phase | What it fixes | Fix mechanism | Target model |
+|-------|--------------|---------------|--------------|
+| 3.5 (V1 adaptive) | Per-layer type selection | Static W_K variance | Mistral 7B |
+| 4 (TQ2_0 + TQ2_1) | Memory efficiency | Mixed bit-widths | All ratio=1.0 models |
+| 6 (runtime variance) | Llama 3-8B sensitivity | Runtime K variance | Llama family |
+| **7 (rank-aware)** | **Qwen3-4B collapse** | **SVD-based rotation** | **Rank-deficient models** |
+
+Phases 6 and 7 are **complementary**, not competing. Phase 6 runs a
+calibration pass to measure runtime variance; Phase 7 runs a calibration
+pass to compute SVD rotations. They can share infrastructure:
+
+- Same calibration corpus
+- Same hook into attention to dump K vectors
+- Same cache schema (keyed by model fingerprint)
+- Same "first load is slower, subsequent loads are instant" flow
+
+Implementing Phase 6 and Phase 7 together amortizes the shared engineering
+cost. The calibration pass produces a bundle `{runtime_variance_per_layer,
+svd_per_layer, rank_per_layer}` that both features consume.
+
+### 7.10 Why This Is Ambitious
+
+- **Novelty**: to our knowledge no open-source KV quantization scheme uses
+  runtime SVD to determine per-layer quantization subspaces. This would
+  be the first.
+- **Unblocks rank-deficient models**: every model with Q→KV ratio < 1.0
+  (Qwen3-4B today, likely many future small models targeting specific
+  head_dims) becomes aggressively quantizable.
+- **Theoretical grounding**: the mechanism is straightforward linear
+  algebra — no black boxes, no training, no hyperparameter sweeps. If
+  the model has the claimed rank structure, the technique provably
+  reduces quantization noise energy.
+- **Infrastructure payoff**: the calibration pipeline, fingerprint cache,
+  and per-layer policy infrastructure benefit every other phase. Phase 7
+  forces us to build the right foundation, not hack around it.
+- **Worst case is informative**: if Phase 7 fails on Qwen3-4B, we learn
+  that the failure mode is NOT rank-deficiency (despite the circumstantial
+  evidence), which redirects the investigation. No work is wasted.
+
+### 7.11 Next Concrete Actions
+
+1. [ ] Add K-vector dump hook to `llm_build_kv_store()` in Lean_llama.cpp
+   (gated by env var `LEANKV_CALIBRATION_DUMP=1`)
+2. [ ] Write calibration corpus file (`calibration-corpus.txt`, ~32 diverse
+   snippets, 2000-4000 tokens total)
+3. [ ] Run calibration dump on Qwen3-4B F16 → collect K vectors per layer
+4. [ ] Python notebook: SVD spectrum analysis for each layer, check rank
+   hypothesis
+5. [ ] If rank < 128 in practice: prototype rank-aware rotation + quantize
+   in Python, measure reconstruction MSE vs Hadamard+TQ3
+6. [ ] If MSE target met: wire into CUDA/Metal/CPU quantize + dequant
+   paths behind a runtime flag
+7. [ ] 3-chunk Qwen3-4B PPL with rank-aware TQ3, compare to baseline +48%
+8. [ ] 160-chunk validation if 3-chunk passes
+9. [ ] Measure impact on Mistral/Gemma (should be neutral or positive — they
+   are full rank so rank-aware ≈ Hadamard)
+10. [ ] Document cache format and ship
+
+---
+
 ## References
 
 - RESULTS.md Section 14 — Phase 4 TQ2_0 validation (baseline)
