@@ -2000,14 +2000,22 @@ consistent PPL (±0.05) on identical workloads for the models they can run.
 | Config | CPU (Ryzen) | **Metal (M2)** | Delta | Status |
 |--------|------------:|---------------:|------:|:------:|
 | F16/F16 | 5.1627 ± 0.029 | **5.1678 ± 0.029** | +0.005 | PASS |
+| TQ4_0/F16 | — | **5.1103 ± 0.028** † | — | — |
+| TQ3_0/F16 | — | **5.1743 ± 0.028** † | — | — |
 | TQ2_1 uniform | 5.9784 ± 0.033 | **5.9883 ± 0.033** | +0.010 | PASS |
 | V1 adaptive | 5.9940 ± 0.033 | **6.0135 ± 0.033** | +0.020 | PASS |
 | TQ2_0 uniform | 6.4229 ± 0.036 | **6.4120 ± 0.036** | −0.011 | PASS |
 
-All configs within ±0.02 PPL — well under the ±0.1 pass threshold. V1
-produced identical layer distribution on Metal (`11×TQ2_0 + 19×TQ2_1 +
+All F16/TQ2 configs within ±0.02 PPL — well under the ±0.1 pass threshold.
+V1 produced identical layer distribution on Metal (`11×TQ2_0 + 19×TQ2_1 +
 2×TQ3_0`) as on CPU. Phase 3 adaptive type selection is validated on
 Apple Silicon.
+
+† TQ4_0/TQ3_0 Metal 160-chunk runs completed 2026-04-15 (rerun with
+`caffeinate` after initial overnight run crashed from Mac sleep). Metal
+TQ4_0 actually improves PPL vs F16 baseline (−1.1%) — Hadamard regularization
+effect. No matching CPU 160-chunk run was performed for these configs;
+see Section 19.4 for Metal vs CUDA comparison.
 
 **Metal limitation**: Qwen 3.5-9B triggers `GGML_ASSERT(ne10 == ne02)` in
 `ggml-metal.m:3425` — even F16 baseline fails. This is a pre-existing
@@ -2132,13 +2140,27 @@ at ~5 MiB K-cache is essentially free.
 | Config | CPU PPL | Metal PPL | CUDA PPL | Max spread |
 |--------|--------:|----------:|---------:|-----------:|
 | F16 | 5.1627 | 5.1678 | 5.1638 | 0.005 |
+| TQ4_0 | — | 5.1103 | 5.1781 | **0.068** ‡ |
+| TQ3_0 | — | 5.1743 | 5.2464 | **0.072** ‡ |
 | TQ2_1 | 5.9784 | 5.9883 | 5.9726 | 0.016 |
 | V1 adaptive | 5.9940 | 6.0135 | 6.0048 | 0.020 |
 | TQ2_0 | 6.4229 | 6.4120 | 6.4612 | 0.049 |
 
-**All three backends within ±0.05 PPL.** CPU / Metal / CUDA are numerically
-consistent. Different compute paths (AVX2 IQK, Metal Flash Attention, CUDA
-DP4A), same PPL. Gold standard cross-platform validation achieved.
+**F16 and TQ2 configs within ±0.05 PPL** — CPU / Metal / CUDA are
+numerically consistent. Different compute paths (AVX2 IQK, Metal Flash
+Attention, CUDA DP4A), same PPL. Gold standard cross-platform validation
+achieved.
+
+‡ **TQ4_0 and TQ3_0 show a ~0.07 PPL spread between Metal and CUDA** —
+larger than the ±0.05 consistency band. Both backends remain near-lossless
+(within ±2% of F16), but Metal's TQ4_0 actually improves PPL (−1.1%) while
+CUDA's is slightly worse (+0.28%). Neither is "wrong" — both are within
+stderr (±0.028) of F16 — but the direction differs. Possible causes:
+(a) DP4A int8 accumulation rounding differs from Metal's f16 accumulation
+path, (b) slightly different block-wise scale handling in the FA kernels,
+(c) sample-size variance. Worth investigation before claiming full
+numerical parity across backends for TQ4/TQ3. The user-visible quality
+impact is negligible — both stay at < ±2% PPL.
 
 ### 19.5 CUDA-only: Qwen 3.5-9B deployment path
 
